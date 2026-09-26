@@ -362,6 +362,51 @@ Google's own reclamation bypass the save guard.
 Keep Codex, Claude Code, or your preferred coding agent on your Mac. Their login
 and configuration survive runtime deletion; the MCP tools operate the GPU worker.
 
+### Claude Code: talk to your GPU from your Mac
+
+After [installing and authenticating](#install-and-authenticate), register the
+server once. If you already have a custom `colab` skill, merge its instructions
+instead of overwriting it. Run these commands from the cloned repository:
+
+```sh
+claude mcp add --scope user --transport stdio colab-persist -- "$(command -v colab-persist-mcp)"
+mkdir -p ~/.claude/skills/colab
+cp integrations/claude-code/colab/SKILL.md ~/.claude/skills/colab/SKILL.md
+claude mcp get colab-persist
+```
+
+The connection and `/colab` skill are available across your local projects.
+Start a new Claude Code session in your project folder:
+
+```sh
+claude
+```
+
+Then say, for example:
+
+```text
+/colab Check my account and whether any GPU is running.
+/colab Run train.py on an L4, save checkpoints to Drive, and stop when finished.
+/colab Download this dataset on Colab, keep durable shards in Drive, and use a bounded local cache.
+```
+
+You can also ask in plain language; the skill is discoverable automatically.
+Claude stays on the Mac and uses MCP/SSH for remote work. Dataset downloads
+started on the VM use Colab's network, without routing the dataset through your
+Mac. You do not need another Claude login for each GPU VM.
+
+Google may still require you to run `colab-persist mount` in a local interactive
+terminal and authorize Drive in your browser. Claude then continues with the
+mounted runtime. It never needs your OAuth code in chat. For long jobs, the skill
+uses the CLI in a monitored background Bash task to avoid short MCP tool deadlines;
+keep the Mac awake and connected. Normal Claude tool permissions still apply.
+
+The skill covers remote command routing, bounded datasets, application resume,
+account switching, and stopping only after a confirmed save. It does not turn
+Colab into an always-on service or make an arbitrary trainer resumable.
+
+### Codex and other MCP clients
+
 ```json
 {
   "mcpServers": {
