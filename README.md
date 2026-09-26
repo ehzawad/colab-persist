@@ -7,6 +7,38 @@ Colab Persist adds verified workspace checkpoints and a local MCP server/client 
 **L4 is the default GPU. No notebook editing or tmux is required.** Google may still
 ask you to authorize a Drive mount in your browser when a new VM starts.
 
+## Quick command reference
+
+New here? [Install and authenticate](#install-and-authenticate) first. These
+commands use the Google account selected by `colab-persist login`.
+
+| What you want to do | Command |
+|---|---|
+| Check the selected account and whether a GPU is running | `colab-persist status` |
+| List every active runtime on that account | `colab-persist sessions` |
+| Start a GPU, mount Drive, and restore your workspace | `colab-persist start` |
+| Start a T4 instead of the default L4 | `colab-persist start --gpu T4` |
+| Open an SSH shell on the running VM | `colab-persist ssh` |
+| Check the GPU from your Mac | `colab-persist ssh -- nvidia-smi` |
+| Run a local script, save its workspace, then stop the VM | `colab-persist run ./train.py --project experiment` |
+| Upload the current project folder and pass script arguments | `colab-persist run ./train.py --source . --project experiment -- --epochs 10` |
+| Save your work to Drive and shut down the VM | `colab-persist stop` |
+| Select another saved Google account, or sign in to a new one | `colab-persist login --email OTHER_GOOGLE_EMAIL` |
+| See all commands or a command's options | `colab-persist --help` / `colab-persist run --help` |
+
+`start` uses your configured GPU, initially **L4**. A different `--gpu` does not
+resize a running VM: save and stop it first. Account switching also requires the
+old account's runtimes to be stopped. `status` and `sessions` never allocate a VM;
+`ssh` requires one to be running already. Scripts and outputs must stay inside the
+managed workspace to be saved.
+
+More commands: [save and restore](#checkpoints-and-shutdown) ·
+[account switching](#accounts-and-the-official-cli) ·
+[built-in `colab` commands](#useful-built-in-colab-commands) ·
+[large datasets](LARGE_DATA.md) · [Codex and MCP setup](#mcp-local-agents-remote-cuda).
+
+## How it works
+
 ```text
 Mac: source code + coding agents + credentials
                     │ SSH / official Colab CLI
@@ -53,7 +85,9 @@ colab-persist login --email YOUR_GOOGLE_EMAIL --no-launch-browser
 ```
 
 The official Colab CLI is installed inside the tool's isolated Python environment;
-you do not need to install it separately. If `colab-persist` is not found after
+you do not need to install it separately to use `colab-persist`. A standalone
+`colab` command is optional; see the [built-in command reference](#useful-built-in-colab-commands).
+If `colab-persist` is not found after
 installation, run `uv tool update-shell` and open a new terminal. Keep your own
 Google credentials on your computer; no repository credentials are supplied.
 
@@ -203,6 +237,66 @@ L4 remains the configured default. Availability and compute-unit cost depend on
 your account. The helper never silently substitutes another GPU or changes a live
 runtime's hardware; save and stop it first.
 
+## Useful built-in `colab` commands
+
+These are commands from **Google's official CLI 0.7.4**, the version this project
+pins. They operate independently of `colab-persist`. The wrapper installation
+includes the CLI internally; if you also want a standalone `colab` executable:
+
+```sh
+uv tool install google-colab-cli==0.7.4
+colab --help
+colab version
+colab update                 # checks for updates; does not install them
+```
+
+**Account and session selection are separate.** Bare `colab` defaults to OAuth2.
+The examples below explicitly use `--auth adc`, which uses your shell's
+`GOOGLE_APPLICATION_CREDENTIALS` file or global ADC login. Neither automatically
+follows the private account selected by `colab-persist login`. The native CLI also
+uses its own session file, so its session names do not automatically identify
+wrapper-managed VMs. See [Google's local ADC setup guide](https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment)
+to set up ADC for the native CLI if needed.
+
+The name `native-demo` below is a **separate, independently managed session**.
+For your persistent workspace, use the `colab-persist` commands above.
+
+| What you want to do | Official CLI command |
+|---|---|
+| List active runtimes on the native CLI's account | `colab --auth adc sessions` |
+| Check a named session | `colab --auth adc status -s native-demo` |
+| Show compute-unit balance and usage rate | `colab --auth adc usage` |
+| Create an L4 session | `colab --auth adc new -s native-demo --gpu L4` |
+| Open SSH | `colab --auth adc ssh -s native-demo` |
+| Open an interactive Python prompt | `colab --auth adc repl -s native-demo` |
+| Execute a local Python file on the existing session | `colab --auth adc exec -s native-demo -f ./train.py --timeout 600` |
+| Install a Python package on the VM | `colab --auth adc install -s native-demo numpy` |
+| List remote files | `colab --auth adc ls -s native-demo /content` |
+| Upload one file | `colab --auth adc upload -s native-demo ./input.json /content/input.json` |
+| Download one file | `colab --auth adc download -s native-demo /content/output.json ./output.json` |
+| View recent session events | `colab --auth adc log -s native-demo -n 20` |
+| Open the session's notebook URL in a browser | `colab --auth adc url -s native-demo --open` |
+| Stop this native session without a wrapper checkpoint | `colab --auth adc stop -s native-demo` |
+
+Replace `L4` with `T4` when creating a T4 session. Native `new` defaults to CPU if
+you omit `--gpu` and `--tpu`. Native `ssh` can create a VM if the named session is
+missing; use `sessions` or `status` to check first. If needed, pass
+`-i /path/to/private_ssh_key` to `ssh`. Upload and download transfer individual
+files, not whole project folders. Installed packages and files on these native
+VMs disappear when the VM is deleted unless you save them elsewhere.
+
+For a disposable script run, the native CLI also offers:
+
+```sh
+colab --auth adc run --gpu T4 --timeout 600 ./train.py --epochs 10
+```
+
+This creates a fresh VM and stops it afterward. Put CLI options **before** the
+script path; everything after it is passed to the script. Native `run` does not
+perform Colab Persist's Drive checkpoints. Native `stop`, `restart-kernel`, and
+`drivemount` also bypass its save and locking checks. Always use
+`colab-persist stop` to save and shut down a wrapper-managed VM.
+
 ## Projects and script arguments
 
 Only the named script is uploaded by default. To include a whole project:
@@ -317,8 +411,8 @@ replayed workload cannot silently allocate repeated GPUs or duplicate side effec
 | [colabctl](https://github.com/mandipadk/colabctl) | Broader runtime/job APIs, MCP, and direct Drive checkpoint helpers | A fuller alternative; its direct Drive transfers require a Cloud quota project and Drive API |
 | [Colab MCP](https://github.com/googlecolab/colab-mcp) | Local-agent bridge to a Colab session in the browser | Useful for notebook interaction |
 
-This is a small, independent workflow layer for a single account and named runtime,
-not an official Google product. It deliberately uses the native Drive mount already
+This is a small, independent workflow layer for one selected account and named
+runtime at a time, not an official Google product. It uses the native Drive mount already
 supported by Colab; no separate Google Cloud project is needed for that mount.
 
 ## Development and verification
