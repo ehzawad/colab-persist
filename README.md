@@ -49,10 +49,7 @@ git clone https://github.com/ehzawad/colab-persist.git
 cd colab-persist
 uv tool install .
 colab-persist configure --email YOUR_GOOGLE_EMAIL --gpu L4
-
-gcloud auth application-default login YOUR_GOOGLE_EMAIL --no-launch-browser \
-  --disable-quota-project \
-  --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
+colab-persist login --email YOUR_GOOGLE_EMAIL --no-launch-browser
 ```
 
 The official Colab CLI is installed inside the tool's isolated Python environment;
@@ -85,13 +82,84 @@ and stops its VM, so the final status should be inactive. Expect a browser conse
 step for each new VM's Drive mount. These runs consume Colab compute units.
 This flow was [verified from a fresh public clone on macOS](VALIDATION.md#version-021-fresh-installation-and-recovery).
 
-Configuration lives in `~/.config/colab-persist/config.json`; Google credentials use
-the existing local ADC store. A dedicated Ed25519 key is created only if the selected
-key does not exist. None of these files are uploaded by this tool.
+Configuration lives in `~/.config/colab-persist/config.json`. Login stores private
+Google ADC credentials and session mappings under `~/.config/colab-persist/accounts/`,
+separated by account. Existing installations without private credentials continue
+to use their current ADC login until `login` is explicitly run. A dedicated Ed25519
+key is created only if the selected key does not exist. None of these files are
+uploaded by this tool.
 
 If Colab's initial Drive mount fails immediately after consent, the helper retries
 once and verifies the actual mount. A failed mount never becomes an ordinary local
 directory masquerading as persistent storage.
+
+## Accounts and the official CLI
+
+`colab` and `colab-persist` are separate executables. With the pinned CLI version
+0.7.4, bare `colab` defaults to OAuth2, while this wrapper explicitly uses ADC.
+They can therefore be signed in as different Google accounts. The wrapper uses a
+private session file for each account and does not edit the official CLI's shared
+session file. During upgrade, an existing mapping is copied only after the server
+confirms that its runtime belongs to the verified account.
+Upstream CLI history, logs and settings remain shared; only credentials and session
+mappings have separate account storage.
+
+Use these commands to check the account and its runtimes without allocating one:
+
+```sh
+colab-persist status       # selected account, managed runtime, total active count
+colab-persist sessions     # every runtime on that account, including unmanaged ones
+```
+
+`active: false` means the configured managed session is absent. Check
+`active_runtimes: 0` to confirm that the selected account has no runtimes at all.
+These commands do not inspect other Google accounts.
+
+To verify and save another account's login while keeping the current account selected:
+
+```sh
+colab-persist login --email OTHER_GOOGLE_EMAIL --no-switch
+```
+
+This verifies the target email and Colab access, then saves its private credentials.
+It leaves the selected-account configuration unchanged and does not require the
+current account's runtimes to stop. Select the saved account later using `login`
+without `--no-switch`; the normal checks for running VMs apply then.
+
+To switch later, save and stop the current account's runtimes, then log in:
+
+```sh
+colab-persist stop         # if the managed VM is active
+colab-persist login --email OTHER_GOOGLE_EMAIL
+colab-persist status
+colab-persist start --gpu T4
+```
+
+The switch refuses while the old account has any running Colab VM. Save and stop
+unmanaged runtimes through their owning workflow. New browser credentials are
+staged separately; the expected email and Colab access are verified before changing
+the selection. Cancelled or wrong-account login leaves the selection unchanged.
+Previously saved accounts can be selected again with the same `login --email`
+command; `--reauth` requests fresh browser consent if credentials expired or were
+revoked. The current account must still authenticate so its running VMs can be
+checked; reauthenticate it first if needed. Sign in privately once per account,
+including an account previously used only through global ADC, before cached
+switching is available. Account switching never transfers files between Google Drives. Authorize
+each VM's Drive mount using the selected Colab account; the browser consent step
+is responsible for choosing the matching Drive identity.
+
+`configure --email` sets the account expectation on first setup; it cannot change
+an existing account. `login` does not overwrite global gcloud credentials, the
+official CLI's OAuth2 token, or coding-agent logins. An explicit private login also
+takes precedence over a shell's `GOOGLE_APPLICATION_CREDENTIALS` setting. Merely
+running `gcloud config set account` does not switch ADC credentials; see
+[Google's ADC documentation](https://docs.cloud.google.com/docs/authentication/application-default-credentials).
+
+Use the wrapper's SSH and persistence commands for its managed VM. Raw commands
+such as `colab stop` or `colab restart-kernel` can still affect that same server if
+authenticated to its account, and bypass the wrapper's save/locking checks.
+Account isolation cannot prevent changes made directly through Google or another
+CLI. Avoid simultaneous raw CLI mutations of a managed runtime.
 
 ## Terminal and SSH workflow
 

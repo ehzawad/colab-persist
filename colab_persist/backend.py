@@ -5,7 +5,6 @@ import contextlib
 import fcntl
 import io
 import json
-import logging
 import os
 from pathlib import Path
 import shlex
@@ -18,9 +17,8 @@ import tempfile
 import time
 
 from google.auth.transport.requests import AuthorizedSession
-from colab_cli.auth import AuthProvider, _get_adc_credentials
-from colab_cli.common import State
-from . import datasets, remote
+from colab_cli.client import Client, Prod
+from . import accounts, datasets, remote, session_state
 
 CONFIG_DIR = Path.home() / ".config" / "colab-persist"
 REMOTE_ENGINE = "/content/.colab-persist/remote.py"
@@ -33,6 +31,7 @@ def config():
     value = json.loads(path.read_text())
     if not value.get("expected_email"):
         raise RuntimeError("The configuration must specify expected_email.")
+    accounts.normalize_email(value["expected_email"])
     remote.valid_name(value.get("session", "cuda"))
     remote.valid_name(value.get("drive_folder", "Colab-CUDA"))
     limit = value.get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
@@ -57,16 +56,64 @@ def operation_lock():
 
 def identity():
     cfg = config()
-    logging.getLogger("colab_cli.auth").setLevel(logging.ERROR)
-    logging.getLogger("google.auth._default").setLevel(logging.ERROR)
-    credentials = _get_adc_credentials()
-    response = AuthorizedSession(credentials).get(
-        "https://openidconnect.googleapis.com/v1/userinfo", timeout=20)
-    response.raise_for_status()
-    email = response.json().get("email", "").lower()
-    if email != cfg["expected_email"].lower():
-        raise RuntimeError(f"Google account mismatch: expected {cfg['expected_email']}, got {email}.")
-    return email
+    accounts.verified_credentials(cfg)
+    return cfg["expected_email"].lower()
+
+
+def assignments_for(cfg):
+    credentials = accounts.verified_credentials(cfg)
+    with AuthorizedSession(credentials) as session:
+        return Client(Prod(), session).list_assignments()
+
+
+def login(email, *, reauth=False, no_launch_browser=False, no_switch=False):
+    """Verify and save private credentials, optionally selecting that account."""
+    email = accounts.normalize_email(email)
+    with operation_lock():
+        previous = config()
+        switching = not no_switch and email != previous["expected_email"].lower()
+
+        def require_old_account_stopped():
+            if switching and assignments_for(previous):
+                raise RuntimeError("The current Google account still has active Colab runtimes. "
+                                   "Save and stop them before switching accounts.")
+
+        require_old_account_stopped()
+        directory = session_state.session_path(CONFIG_DIR, email).parent
+        saved = directory / "credentials.json"
+        candidate = {**previous, "expected_email": email, "credentials_file": str(saved)}
+        if reauth or not saved.exists():
+            # Isolate gcloud's ADC output and configuration; the user's normal ADC
+            # and gcloud account selection are never overwritten.
+            with tempfile.TemporaryDirectory(prefix="login-", dir=directory) as temporary:
+                env = os.environ.copy()
+                env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+                env["CLOUDSDK_CONFIG"] = temporary
+                command = ["gcloud", "auth", "application-default", "login", email,
+                           "--disable-quota-project", "--scopes=" + ",".join(accounts.SCOPES)]
+                if no_launch_browser:
+                    command.append("--no-launch-browser")
+                result = subprocess.run(command, env=env)
+                if result.returncode:
+                    raise RuntimeError("Google login did not finish; account selection is unchanged.")
+                staged = Path(temporary) / "application_default_credentials.json"
+                candidate["credentials_file"] = str(staged)
+                assignments = assignments_for(candidate)  # Verify email and Colab access before committing.
+                require_old_account_stopped()  # A runtime may have started during browser consent.
+                staged.chmod(0o600)
+                staged.replace(saved)
+        else:
+            assignments = assignments_for(candidate)
+            require_old_account_stopped()
+        candidate["credentials_file"] = str(saved)
+        if not no_switch:
+            remote.write_json(CONFIG_DIR / "config.json", candidate)
+            (CONFIG_DIR / "config.json").chmod(0o600)
+        return {"account": email, "account_verified": True, "switched": switching,
+                "selected_account": previous["expected_email"] if no_switch else email,
+                "saved_only": no_switch,
+                "active_runtimes": len(assignments), "global_gcloud_credentials_changed": False,
+                "next": "colab-persist login --email " + email if no_switch else "colab-persist status"}
 
 
 def colab_command():
@@ -75,12 +122,13 @@ def colab_command():
         executable = Path(shutil.which("colab") or "")
     if not executable.is_file():
         raise RuntimeError("Install google-colab-cli in this environment first.")
-    return [str(executable), "--auth", "adc"]
+    return [str(executable), "--auth", "adc", "--config",
+            str(session_state.session_path(CONFIG_DIR, config()["expected_email"]))]
 
 
-def checked(arguments, *, data=None, timeout=180):
+def checked(arguments, *, data=None, timeout=180, env=None):
     result = subprocess.run(arguments, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=timeout)
+                            timeout=timeout, env=env)
     if result.returncode:
         detail = (result.stderr + result.stdout).decode(errors="replace")[-4000:]
         raise RuntimeError(f"Command failed ({result.returncode}): {detail}")
@@ -88,13 +136,23 @@ def checked(arguments, *, data=None, timeout=180):
 
 
 def session_info():
-    identity()
-    state = State()
-    state.auth_provider = AuthProvider.ADC
-    with contextlib.redirect_stdout(sys.stderr):
-        sessions, _ = state.sync_sessions()
-    item = sessions.get(config().get("session", "cuda"))
-    return item
+    cfg = config()
+    credentials = accounts.verified_credentials(cfg)
+    sessions, _ = session_state.synced_state(CONFIG_DIR, cfg, credentials)
+    return sessions.get(cfg.get("session", "cuda"))
+
+
+def list_sessions():
+    with operation_lock():
+        cfg = config()
+        credentials = accounts.verified_credentials(cfg)
+        sessions, assignments = session_state.synced_state(CONFIG_DIR, cfg, credentials)
+        names = {item.endpoint: name for name, item in sessions.items()}
+        return {"account": cfg["expected_email"], "account_verified": True,
+                "active_runtimes": len(assignments), "sessions": [
+                    {"endpoint": item.endpoint, "name": names.get(item.endpoint),
+                     "managed": names.get(item.endpoint) == cfg.get("session", "cuda")}
+                    for item in assignments]}
 
 
 def require_session():
@@ -145,7 +203,8 @@ def kernel_call(operation, *, item, timeout=900, **parameters):
         script = Path(temporary) / "operation.py"
         script.write_text(code)
         raw = checked([*colab_command(), "exec", "-s", item.name, "-f", str(script),
-                       "--timeout", str(timeout)], timeout=timeout + 60).decode(errors="replace")
+                       "--timeout", str(timeout)], timeout=timeout + 60,
+                      env=accounts.environment(config())).decode(errors="replace")
     return parse_result(raw)
 
 
@@ -222,7 +281,7 @@ def start_runtime(gpu=None):
         if created:
             cfg = config()
             checked([*colab_command(), "new", "-s", cfg.get("session", "cuda"),
-                     "--gpu", selected], timeout=300)
+                     "--gpu", selected], timeout=300, env=accounts.environment(cfg))
             item = require_session()
         install_engine(item)
         write_ssh_alias(item)
@@ -231,11 +290,18 @@ def start_runtime(gpu=None):
 
 
 def status():
-    item = session_info()
-    if item is None:
-        return {"active": False, "account_verified": True, "next": "colab-persist start"}
-    return {"active": True, "session": item.name, "endpoint": item.endpoint,
-            **remote_call("status", item=item)}
+    with operation_lock():
+        cfg = config()
+        credentials = accounts.verified_credentials(cfg)
+        sessions, assignments = session_state.synced_state(CONFIG_DIR, cfg, credentials)
+        item = sessions.get(cfg.get("session", "cuda"))
+        summary = {"account": cfg["expected_email"], "account_verified": True,
+                   "active_runtimes": len(assignments)}
+        if item is None:
+            return {**summary, "active": False,
+                    "next": "colab-persist sessions" if assignments else "colab-persist start"}
+        return {**summary, "active": True,
+                "session": item.name, "endpoint": item.endpoint, **remote_call("status", item=item)}
 
 
 def mount_drive():
@@ -245,7 +311,8 @@ def mount_drive():
         if remote_call("status", item=item)["drive_mounted"]:
             return {"drive_mounted": True}
         for attempt in range(2):
-            completed = subprocess.run([*colab_command(), "drivemount", "-s", item.name])
+            completed = subprocess.run([*colab_command(), "drivemount", "-s", item.name],
+                                       env=accounts.environment(config()))
             if completed.returncode == 0 and remote_call("status", item=item)["drive_mounted"]:
                 return {"drive_mounted": True}
             if attempt == 0:
@@ -269,7 +336,8 @@ def _save_and_stop(item, stop):
     if stop:
         if require_session().endpoint != item.endpoint:
             raise RuntimeError("Runtime changed during saving. Refusing to stop a different VM.")
-        checked([*colab_command(), "stop", "-s", item.name], timeout=180)
+        checked([*colab_command(), "stop", "-s", item.name], timeout=180,
+                env=accounts.environment(config()))
     return {"stopped": stop, "drive_flushed": True, "flushed_at": receipt["flushed_at"],
             "checkpoints": [checkpoint_summary(s) for s in receipt["checkpoints"]]}
 

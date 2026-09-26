@@ -209,6 +209,7 @@ class ShutdownTests(unittest.TestCase):
 
     def test_mount_checks_filesystem_even_when_cli_returns_zero(self):
         with patch.object(backend, "operation_lock", side_effect=contextlib.nullcontext), \
+             patch.object(backend, "config", return_value={}), \
              patch.object(backend, "require_session", return_value=SimpleNamespace(name="cuda")), \
              patch.object(backend, "colab_command", return_value=["unused"]), \
              patch.object(backend, "remote_call", side_effect=[
