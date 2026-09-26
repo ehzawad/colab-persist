@@ -115,6 +115,17 @@ colab-persist sessions     # every runtime on that account, including unmanaged 
 `active_runtimes: 0` to confirm that the selected account has no runtimes at all.
 These commands do not inspect other Google accounts.
 
+To verify and save another account's login while keeping the current account selected:
+
+```sh
+colab-persist login --email OTHER_GOOGLE_EMAIL --no-switch
+```
+
+This verifies the target email and Colab access, then saves its private credentials.
+It leaves the selected-account configuration unchanged and does not require the
+current account's runtimes to stop. Select the saved account later using `login`
+without `--no-switch`; the normal checks for running VMs apply then.
+
 To switch later, save and stop the current account's runtimes, then log in:
 
 ```sh

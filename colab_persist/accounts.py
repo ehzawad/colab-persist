@@ -2,6 +2,7 @@
 import logging
 import os
 from pathlib import Path
+import warnings
 
 import google.auth
 from google.auth.transport.requests import AuthorizedSession
@@ -47,7 +48,15 @@ def verified_credentials(cfg):
     path = credentials_path(cfg)
     try:
         if path:
-            credentials, _ = google.auth.load_credentials_from_file(str(path), scopes=list(SCOPES))
+            # Match the official CLI's narrow suppression for user ADC without
+            # a quota project. Colab does not require one for this login.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Your application has authenticated using end user credentials.*",
+                    category=UserWarning,
+                )
+                credentials, _ = google.auth.load_credentials_from_file(str(path), scopes=list(SCOPES))
         else:
             credentials = _get_adc_credentials()
         with AuthorizedSession(credentials) as session:

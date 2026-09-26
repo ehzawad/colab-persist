@@ -17,21 +17,47 @@ Account changes use a staged login, validate the email and Colab access, and ref
 to leave an account with active runtimes. Status includes the total runtime count;
 the new `sessions` command includes runtimes outside the configured managed session.
 
-All **85 tests** passed on macOS with Python 3.14.7, and the wheel and source
+All **95 tests** passed on macOS with Python 3.14.7, and the wheel and source
 distribution built successfully. Automated tests exercise cached A-to-B-to-A switching, browser-login cancellation,
 wrong identity, denied Colab access, runtime creation during consent, private
 credential precedence, same-account reauthentication, state isolation and verified
-legacy adoption. These tests use temporary fake credentials and mocked Google
-responses. They do not establish that another real account has completed consent,
-has a paid subscription, or can allocate a particular GPU.
+legacy adoption. Save-only login and the narrow suppression of the SDK's expected
+quota-project notice are also covered. The suite passed with the tool's config
+directory pointed at a new empty temporary directory, removing reliance on the
+maintainer's installed configuration. These tests use fake credentials and mocked
+Google responses; the separate live checks below use real accounts.
 
 The installed gcloud was also checked with a temporary `CLOUDSDK_CONFIG` directory;
-it reported that isolated path without starting a login flow. No real account
-switch or GPU allocation was performed for this update. Live `status` and `sessions`
-calls verified the existing account and reported zero active runtimes. The existing
-account configuration and global ADC file remained byte-for-byte unchanged.
-The live CUDA/Drive
-recovery evidence below belongs to version 0.2.1.
+it reported that isolated path without starting a login flow. Initial live `status`
+and `sessions` calls verified the existing account and reported zero active runtimes.
+
+### Live two-account round trip
+
+1. Signed into a second account in Chrome using `login --email ... --no-switch`.
+   Google identity and Colab API access verified successfully, private credentials
+   were saved, and the original account remained selected.
+2. Selected the saved second account with `login --email ...` and allocated an L4.
+3. Authorized its native Drive mount in the same account's browser. The first mount
+   attempt failed during credential propagation; the existing retry succeeded.
+4. Ran `examples/cuda_demo.py` in project `account-switch-20260927`. CUDA compiled,
+   all 256 GPU results passed, and the new project's counter became 1.
+5. Saved seven files (356,567 archive bytes), confirmed Drive's flush, and stopped
+   the VM. `sessions` separately confirmed zero runtimes on that account.
+6. Signed into the original account in Dia and selected it again with `login`.
+   The return succeeded, both accounts now had private saved logins, and the
+   original account also reported zero runtimes. The default remained L4.
+
+Snapshot: `20260926T204530146291Z-8812628d`.
+Archive SHA-256:
+`e7b1f3a09515bf9077d66f533ecda85e2031db83d2e81937bbb2d7a0bea9da20`.
+Final durability: `drive_flush_confirmed` at 2026-09-26 20:45:40 UTC.
+Global gcloud ADC remained byte-for-byte unchanged throughout the round trip.
+No account identifiers or credentials are included in this record.
+
+This validates real account selection, VM allocation, SSH, native Drive mounting,
+CUDA execution, saving and returning to the original account. It does not migrate
+files between accounts or test a 1 TB transfer. Recovery onto a replacement VM was
+tested separately in version 0.2.1 below.
 
 ## Version 0.2.1 fresh installation and recovery
 

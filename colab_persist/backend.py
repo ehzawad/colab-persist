@@ -66,12 +66,12 @@ def assignments_for(cfg):
         return Client(Prod(), session).list_assignments()
 
 
-def login(email, *, reauth=False, no_launch_browser=False):
-    """Stage, verify and commit account selection under the persistence lock."""
+def login(email, *, reauth=False, no_launch_browser=False, no_switch=False):
+    """Verify and save private credentials, optionally selecting that account."""
     email = accounts.normalize_email(email)
     with operation_lock():
         previous = config()
-        switching = email != previous["expected_email"].lower()
+        switching = not no_switch and email != previous["expected_email"].lower()
 
         def require_old_account_stopped():
             if switching and assignments_for(previous):
@@ -106,11 +106,14 @@ def login(email, *, reauth=False, no_launch_browser=False):
             assignments = assignments_for(candidate)
             require_old_account_stopped()
         candidate["credentials_file"] = str(saved)
-        remote.write_json(CONFIG_DIR / "config.json", candidate)
-        (CONFIG_DIR / "config.json").chmod(0o600)
+        if not no_switch:
+            remote.write_json(CONFIG_DIR / "config.json", candidate)
+            (CONFIG_DIR / "config.json").chmod(0o600)
         return {"account": email, "account_verified": True, "switched": switching,
+                "selected_account": previous["expected_email"] if no_switch else email,
+                "saved_only": no_switch,
                 "active_runtimes": len(assignments), "global_gcloud_credentials_changed": False,
-                "next": "colab-persist status"}
+                "next": "colab-persist login --email " + email if no_switch else "colab-persist status"}
 
 
 def colab_command():

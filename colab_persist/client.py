@@ -81,6 +81,7 @@ def main():
     login.add_argument("--email", required=True)
     login.add_argument("--reauth", action="store_true", help="Refresh saved login through browser consent")
     login.add_argument("--no-launch-browser", action="store_true", help="Print the consent URL for manual browser login")
+    login.add_argument("--no-switch", action="store_true", help="Verify and save this login without changing the selected account")
     start = commands.add_parser("start", help="Start/reuse the selected GPU and mount Drive")
     start.add_argument("--gpu", choices=["T4", "L4", "G4", "H100", "A100"])
     start.add_argument("--no-mount", action="store_true")
@@ -119,7 +120,8 @@ def main():
         if args.command == "configure":
             result = configure(args)
         elif args.command == "login":
-            result = backend.login(args.email, reauth=args.reauth, no_launch_browser=args.no_launch_browser)
+            result = backend.login(args.email, reauth=args.reauth, no_launch_browser=args.no_launch_browser,
+                                   no_switch=args.no_switch)
         elif args.command == "sessions":
             result = backend.list_sessions()
         elif args.command == "mount":

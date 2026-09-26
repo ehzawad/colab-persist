@@ -1,7 +1,10 @@
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -217,6 +220,70 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(len(self.login_calls), 1)
         self.assertEqual(json.loads(self.first_path.read_text())["marker"], "new-browser-login")
         self.assertEqual(backend.config(), self.cfg)
+
+    def test_save_login_without_switch_preserves_selection_and_can_be_selected_later(self):
+        previous = self.before()
+        result = backend.login(self.second, no_switch=True)
+        self.assert_unchanged(previous)
+        self.assertTrue(result["saved_only"])
+        self.assertFalse(result["switched"])
+        self.assertTrue(result["account_verified"])
+        self.assertEqual(result["account"], self.second)
+        self.assertEqual(result["selected_account"], self.first)
+        self.assertEqual(self.assignment_calls, [self.second])
+        saved = session_state.session_path(self.config_dir, self.second).parent / "credentials.json"
+        self.assertEqual(json.loads(saved.read_text())["email"], self.second)
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+        self.assertEqual(len(self.login_calls), 1)
+
+        selected = backend.login(self.second)
+        self.assertTrue(selected["switched"])
+        self.assertFalse(selected["saved_only"])
+        self.assertEqual(selected["selected_account"], self.second)
+        self.assertEqual(backend.config()["expected_email"], self.second)
+        self.assertEqual(backend.config()["credentials_file"], str(saved))
+        self.assertEqual(len(self.login_calls), 1)
+        self.assertEqual(self.first_path.read_bytes(), previous[self.first_path])
+
+    def test_save_login_does_not_authenticate_or_query_old_running_expired_account(self):
+        self.cache(self.first, marker="old-expired", expired=True)
+        self.assignment_results[self.first] = [[SimpleNamespace(endpoint="old-running")]]
+        previous = self.before()
+        backend.login(self.second, no_switch=True)
+        self.assert_unchanged(previous)
+        self.assertNotIn(self.first_path, self.loaded_paths)
+        self.assertEqual(self.assignment_calls, [self.second])
+        self.assertEqual(len(self.assignment_results[self.first]), 1)
+
+    def test_cached_save_login_does_not_change_configuration_or_reauthenticate(self):
+        second_path = self.cache(self.second, marker="cached-second")
+        previous = self.before(second_path)
+        result = backend.login(self.second, no_switch=True)
+        self.assertTrue(result["saved_only"])
+        self.assert_unchanged(previous)
+        self.assertEqual(self.login_calls, [])
+        self.assertEqual(self.assignment_calls, [self.second])
+
+    def test_wrong_account_during_save_only_preserves_existing_logins(self):
+        second_path = self.cache(self.second, marker="keep-second")
+        previous = self.before(second_path)
+        self.login_email = "wrong@example.com"
+        with self.assertRaisesRegex(RuntimeError, "Google account mismatch"):
+            backend.login(self.second, reauth=True, no_switch=True)
+        self.assert_unchanged(previous)
+        self.assertEqual(self.assignment_calls, [])
+
+    def test_cli_save_only_flag_reaches_login_without_switching(self):
+        with patch.object(sys, "argv", ["colab-persist", "login", "--email", self.second,
+                                        "--no-switch", "--no-launch-browser"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            client.main()
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["saved_only"])
+        self.assertFalse(result["switched"])
+        self.assertEqual(backend.config()["expected_email"], self.first)
+        self.assertEqual(self.assignment_calls, [self.second])
+        self.assertIn("--no-launch-browser", self.login_calls[0][0])
 
     def test_status_reports_external_running_runtime_without_managed_mapping(self):
         assignments = [SimpleNamespace(endpoint="external-running", token="not-for-output")]
