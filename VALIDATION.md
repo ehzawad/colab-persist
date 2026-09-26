@@ -3,6 +3,28 @@
 Tested on macOS with Python 3.14.7, Google Colab CLI 0.7.4, MCP Python SDK 2.2.0,
 and NVIDIA L4 Colab runtimes on 2026-09-27 (Asia/Dhaka).
 
+## Claude Code integration
+
+On 2026-09-27, registered the installed stdio server in Claude Code 2.1.283's
+user configuration and installed the repository's `colab` skill under the user's
+personal skills directory. Claude's server health check reported Connected.
+
+A real local Claude session, started outside this repository, discovered all
+nine MCP tools and the personal `colab` skill. Invoking `/colab` loaded the
+workflow; Claude called `mcp__colab-persist__runtime_status` and reported a
+verified selected account with zero active runtimes. The session completed
+successfully with no permission denials. The test preapproved only this read-only
+MCP tool and the skill; it did not allocate compute, change accounts, or transfer
+data. It also explained remote download routing, local agent login retention,
+and SSH monitoring while a managed job holds the operation lock.
+
+The skill passed frontmatter validation and independent review against the
+implementation. Review added guidance for full-snapshot storage growth and
+pending versus confirmed Drive flush. This verifies Claude integration and live
+status access, not training or a large transfer through Claude. Earlier live
+GPU/Drive checks are recorded separately below. No private session transcript or
+account identifiers are included in this repository.
+
 ## Version 0.3.0 account switching and command coexistence
 
 The account-state review found that the wrapper and bare official CLI shared a
