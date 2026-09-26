@@ -33,6 +33,8 @@ This starts or reuses an L4, mounts Drive, restores the project's last checkpoin
 uploads the script, and runs it on the GPU. During execution it attempts a checkpoint
 every 60 seconds. After the script exits—even with an error—it checkpoints again,
 asks Drive to flush outstanding writes, and stops the VM **only if saving succeeds**.
+Local script paths, source size, project names and checkpoint intervals are checked
+before allocating a GPU. Run the example from the cloned repository directory.
 The example compiles real CUDA, validates 256 results on the GPU, and increments a
 counter restored from the previous run.
 
@@ -50,6 +52,11 @@ gcloud auth application-default login YOUR_GOOGLE_EMAIL --no-launch-browser \
   --disable-quota-project \
   --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
 ```
+
+The official Colab CLI is installed inside the tool's isolated Python environment;
+you do not need to install it separately. If `colab-persist` is not found after
+installation, run `uv tool update-shell` and open a new terminal. Keep your own
+Google credentials on your computer; no repository credentials are supplied.
 
 Use the authorization link from **that exact terminal attempt** and paste its code
 back into the same terminal. Authorize Drive with the same Google account later.

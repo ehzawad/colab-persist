@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -297,19 +298,56 @@ def dataset_plan(manifest_path, cache_gib=40, reserve_gib=20):
     return datasets.plan(manifest, cache_bytes=cache_gib * remote.GIB, reserve_bytes=reserve_gib * remote.GIB)
 
 
-def upload_source(item, project, script_path, source_directory=None):
+def validate_source(script_path, source_directory=None):
+    """Check local source paths and sizes without authentication or content reads."""
     script = Path(script_path).expanduser().resolve(strict=True)
     if script.suffix != ".py" or not script.is_file():
         raise ValueError("run accepts a local Python script; it may invoke nvcc or other build tools.")
     source = Path(source_directory).expanduser().resolve(strict=True) if source_directory else script.parent
+    if not source.is_dir():
+        raise ValueError("Source must be a project directory.")
     if source_directory and source in {Path.home(), Path("/")}:
         raise ValueError("Select a project directory, not your home or filesystem root.")
-    relative = script.relative_to(source)
+    try:
+        relative = script.relative_to(source)
+    except ValueError:
+        raise ValueError("Script must be inside the selected source directory.") from None
     if remote.excluded(relative):
         raise ValueError("Script path matches a credential/cache exclusion.")
     limit = config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
     if script.stat().st_size > limit:
         raise RuntimeError("Script exceeds the source upload size limit.")
+    if source_directory:
+        total = 0
+        for directory, names, files in os.walk(source, followlinks=False):
+            names[:] = [name for name in names
+                        if not remote.excluded(Path(directory, name).relative_to(source))
+                        and not Path(directory, name).is_symlink()]
+            for name in files:
+                path = Path(directory, name)
+                if remote.excluded(path.relative_to(source)) or path.is_symlink():
+                    continue
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                total += info.st_size
+                if total > limit:
+                    raise RuntimeError("Workspace/source exceeds the snapshot size limit. Keep datasets and base "
+                                       "model caches outside the workspace; use the bounded dataset cache.")
+    return script, source, relative
+
+
+def validate_run_inputs(script_path, project="default", source_directory=None, checkpoint_seconds=60):
+    """Reject local input errors before provisioning or connecting to a runtime."""
+    remote.valid_name(project)
+    if type(checkpoint_seconds) is not int or checkpoint_seconds < 10:
+        raise ValueError("Checkpoint interval must be at least 10 seconds.")
+    return validate_source(script_path, source_directory)
+
+
+def upload_source(item, project, script_path, source_directory=None):
+    script, source, relative = validate_source(script_path, source_directory)
+    limit = config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
     files = remote.inventory(source, limit) if source_directory else {relative.as_posix(): {}}
     with tempfile.TemporaryDirectory(prefix="colab-upload-") as temporary:
         archive = Path(temporary) / "source.tar.gz"
@@ -333,7 +371,7 @@ def upload_source(item, project, script_path, source_directory=None):
 
 def run_script(script_path, project="default", arguments=None, source_directory=None,
                checkpoint_seconds=60, stop_after=True):
-    remote.valid_name(project)
+    validate_run_inputs(script_path, project, source_directory, checkpoint_seconds)
     with operation_lock():
         item = require_session()
         prepared = remote_call("prepare", item=item, project=project)

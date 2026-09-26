@@ -108,6 +108,11 @@ def main():
             result = invoke("plan_dataset", manifest_path=str(Path(args.manifest).expanduser().absolute()),
                             cache_gib=args.cache_gib, reserve_gib=args.reserve_gib)
         elif args.command in {"start", "run"}:
+            if args.command == "run":
+                backend.validate_run_inputs(args.script, args.project, args.source,
+                                            args.checkpoint_seconds)
+            else:
+                remote.valid_name(args.project)
             result = invoke("start_runtime", gpu=args.gpu)
             print(f"Runtime {result['session']}: {result['gpu']}", file=sys.stderr)
             if args.command == "run" or not args.no_mount:

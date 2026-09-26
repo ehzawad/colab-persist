@@ -3,6 +3,22 @@
 Tested on macOS with Python 3.14.7, Google Colab CLI 0.7.4, MCP Python SDK 2.2.0,
 and NVIDIA L4 Colab runtimes on 2026-09-27 (Asia/Dhaka).
 
+## Version 0.2.1 onboarding checks
+
+The installed tool, both command launchers, and its Python environment were removed.
+The public HTTPS repository was cloned to a new directory and installed with
+`uv tool install --no-cache .` on macOS 27.0, Apple silicon. The original tool
+configuration was moved aside; setup created a fresh configuration and a new
+mode-0600 SSH key. The fresh installation discovered all nine MCP tools and
+provisioned an L4. Existing uv/Python/gcloud/OpenSSH and Google login credentials
+were retained, so this is a clean application installation, not a factory-reset OS
+or a newly authenticated Google account.
+
+The public 0.2.0 checkout passed all 54 tests. Review of that onboarding flow found
+that invalid local inputs could allocate a GPU before failing. Version 0.2.1 moves
+those checks ahead of allocation and adds eight regression tests (62 total),
+covering CLI and MCP paths without cloud calls.
+
 ## Version 0.2.0 storage checks
 
 On 2026-09-27, all **54 tests** passed in an isolated Python 3.14.7 environment.

@@ -1,6 +1,6 @@
 [project]
 name = "colab-persist"
-version = "0.2.0"
+version = "0.2.1"
 description = "Drive checkpoints for disposable Colab runtimes, with a local MCP server and client"
 readme = "README.md"
 license = "MIT"
