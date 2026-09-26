@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from mcp import Client, StdioServerParameters
-from . import backend, remote
+from . import accounts, backend, remote
 
 
 async def call_tool(name, arguments):
@@ -28,23 +28,34 @@ def invoke(name, **arguments):
 
 
 def configure(args):
-    if "@" not in args.email or any(c.isspace() for c in args.email):
-        raise ValueError("Provide the Google email address you use for Colab and Drive.")
+    with backend.operation_lock():
+        return _configure(args)
+
+
+def _configure(args):
+    email = accounts.normalize_email(args.email)
     if args.snapshot_limit_gib is not None and args.snapshot_limit_gib <= 0:
         raise ValueError("Snapshot limit must be positive.")
     backend.CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = backend.CONFIG_DIR / "config.json"
     previous = json.loads(target.read_text()) if target.exists() else {}
+    if previous and email != previous.get("expected_email", "").lower():
+        raise ValueError("configure does not switch Google credentials. Use `colab-persist login --email "
+                         + email + "` to verify and switch accounts safely.")
     session = args.session or previous.get("session", "cuda")
     gpu = args.gpu or previous.get("gpu", "L4")
     remote.valid_name(session)
     key = Path(args.key or previous.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser().absolute()
+    if previous and (session != previous.get("session", "cuda") or
+                     str(key) != str(Path(previous.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser().absolute())):
+        if backend.assignments_for(previous):
+            raise RuntimeError("Save and stop active runtimes before changing the session name or SSH key.")
     if not key.exists():
         key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "colab-persist",
                         "-f", str(key)], check=True, stdout=subprocess.DEVNULL)
     key.chmod(0o600)
-    value = {**previous, "expected_email": args.email.lower(), "session": session,
+    value = {**previous, "expected_email": email, "session": session,
              "gpu": gpu, "ssh_identity": str(key), "drive_folder": previous.get("drive_folder", "Colab-CUDA")}
     if args.snapshot_limit_gib is not None:
         value["snapshot_limit_bytes"] = args.snapshot_limit_gib * remote.GIB
@@ -66,12 +77,17 @@ def main():
     cfg.add_argument("--ssh-config", help="Optional dedicated SSH config fragment to manage; include it from ~/.ssh/config")
     cfg.add_argument("--snapshot-limit-gib", type=int,
                      help="Workspace/source size cap before hashing (default 5 GiB); excludes external caches")
+    login = commands.add_parser("login", help="Verify and switch Google accounts using private credentials")
+    login.add_argument("--email", required=True)
+    login.add_argument("--reauth", action="store_true", help="Refresh saved login through browser consent")
+    login.add_argument("--no-launch-browser", action="store_true", help="Print the consent URL for manual browser login")
     start = commands.add_parser("start", help="Start/reuse the selected GPU and mount Drive")
     start.add_argument("--gpu", choices=["T4", "L4", "G4", "H100", "A100"])
     start.add_argument("--no-mount", action="store_true")
     start.add_argument("--project", default="default")
     commands.add_parser("mount", help="Authorize and mount Drive in your terminal")
     commands.add_parser("status")
+    commands.add_parser("sessions", help="List all runtimes on the selected Google account, including unmanaged ones")
     commands.add_parser("save", help="Save all managed workspaces and flush/unmount Drive; keep the VM")
     commands.add_parser("stop", help="Save and flush Drive before stopping the VM")
     commands.add_parser("tools", help="List the real MCP tools")
@@ -102,6 +118,10 @@ def main():
     try:
         if args.command == "configure":
             result = configure(args)
+        elif args.command == "login":
+            result = backend.login(args.email, reauth=args.reauth, no_launch_browser=args.no_launch_browser)
+        elif args.command == "sessions":
+            result = backend.list_sessions()
         elif args.command == "mount":
             result = backend.mount_drive()
         elif args.command == "dataset-plan":

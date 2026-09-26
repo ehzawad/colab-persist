@@ -3,6 +3,36 @@
 Tested on macOS with Python 3.14.7, Google Colab CLI 0.7.4, MCP Python SDK 2.2.0,
 and NVIDIA L4 Colab runtimes on 2026-09-27 (Asia/Dhaka).
 
+## Version 0.3.0 account switching and command coexistence
+
+The account-state review found that the wrapper and bare official CLI shared a
+session mapping file despite using different default authentication modes. The
+upstream synchronizer prunes entries absent from its current account, which can
+erase another account's runtime mapping while leaving its VM allocated.
+
+The wrapper now uses account-specific session files and can hold private ADC
+credentials without changing global gcloud login. Legacy mappings are adopted only
+after verifying runtime ownership through the authenticated server response.
+Account changes use a staged login, validate the email and Colab access, and refuse
+to leave an account with active runtimes. Status includes the total runtime count;
+the new `sessions` command includes runtimes outside the configured managed session.
+
+All **85 tests** passed on macOS with Python 3.14.7, and the wheel and source
+distribution built successfully. Automated tests exercise cached A-to-B-to-A switching, browser-login cancellation,
+wrong identity, denied Colab access, runtime creation during consent, private
+credential precedence, same-account reauthentication, state isolation and verified
+legacy adoption. These tests use temporary fake credentials and mocked Google
+responses. They do not establish that another real account has completed consent,
+has a paid subscription, or can allocate a particular GPU.
+
+The installed gcloud was also checked with a temporary `CLOUDSDK_CONFIG` directory;
+it reported that isolated path without starting a login flow. No real account
+switch or GPU allocation was performed for this update. Live `status` and `sessions`
+calls verified the existing account and reported zero active runtimes. The existing
+account configuration and global ADC file remained byte-for-byte unchanged.
+The live CUDA/Drive
+recovery evidence below belongs to version 0.2.1.
+
 ## Version 0.2.1 fresh installation and recovery
 
 The installed tool, both command launchers, and its Python environment were removed.

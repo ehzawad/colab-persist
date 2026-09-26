@@ -3,7 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from . import backend
+from . import accounts, backend
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
         cfg = backend.config()
         command = [*backend.colab_command(), "ssh", "--proxy-mode", "-s", item.name, "-i",
                    str(Path(cfg.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser())]
-        os.execv(command[0], command)
+        os.execve(command[0], command, accounts.environment(cfg))
     except Exception as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1)
