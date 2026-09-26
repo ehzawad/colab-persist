@@ -17,9 +17,11 @@ Colab L4: temporary workspace + CUDA execution
 Google Drive: Colab-CUDA/projects/<project>/
 ```
 
-For datasets larger than VM disk, use the separate manifest-driven shard cache:
-`colab-persist dataset-plan corpus.json`. It stages a bounded working set outside
-workspace snapshots. See [large datasets and LoRA](LARGE_DATA.md) for the 1 TB
+For datasets larger than VM disk, use the separate manifest-driven shard cache.
+`colab-persist dataset-plan corpus.json` validates the manifest and reports storage
+budgets without allocating a GPU or copying data. Your training script uses
+`ShardCache` to stage a bounded working set outside workspace snapshots.
+See [large datasets and LoRA](LARGE_DATA.md) for the 1 TB
 storage layout, checkpoint requirements, and current limits. Do not place a
 training corpus or base model cache inside the managed workspace.
 
@@ -40,7 +42,7 @@ counter restored from the previous run.
 
 ## Install and authenticate
 
-Requires macOS or Linux, Python 3.12+, OpenSSH, `uv`, and Google Cloud CLI.
+Requires macOS or Linux, Git, Python 3.12+, OpenSSH, `uv`, and Google Cloud CLI.
 
 ```sh
 git clone https://github.com/ehzawad/colab-persist.git
@@ -61,6 +63,27 @@ Google credentials on your computer; no repository credentials are supplied.
 Use the authorization link from **that exact terminal attempt** and paste its code
 back into the same terminal. Authorize Drive with the same Google account later.
 The helper checks the Google identity before connecting or allocating a VM.
+
+Check the installation and configured Google identity before allocating a GPU:
+
+```sh
+colab-persist tools                         # nine MCP tools
+colab-persist status                        # checks account and runtime status
+```
+
+Then, from the cloned repository directory, run the CUDA example twice:
+
+```sh
+colab-persist run examples/cuda_demo.py --project first-run
+colab-persist run examples/cuda_demo.py --project first-run
+colab-persist status
+```
+
+With a new project name, the first run reports count 1; the second restores it and
+reports count 2 with previous count 1. Each successful run saves, flushes Drive,
+and stops its VM, so the final status should be inactive. Expect a browser consent
+step for each new VM's Drive mount. These runs consume Colab compute units.
+This flow was [verified from a fresh public clone on macOS](VALIDATION.md#version-021-fresh-installation-and-recovery).
 
 Configuration lives in `~/.config/colab-persist/config.json`; Google credentials use
 the existing local ADC store. A dedicated Ed25519 key is created only if the selected
@@ -241,7 +264,7 @@ uv run --no-editable colab-persist tools
 Tests cover recovery into a new workspace, corruption, interrupted publication,
 credential/link exclusions, malicious archives, overwrite protection, script errors,
 active-job locks, and refusal to stop after a failed flush. Live GPU/Drive checks
-consume compute units and require your own account; see `VALIDATION.md` for the
+consume compute units and require your own account; see [VALIDATION.md](VALIDATION.md) for the
 maintainer's recorded verification.
 
 Sources: [Colab FAQ and runtime limits](https://research.google.com/colaboratory/faq.html),
