@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from colab_persist import remote, backend
+from colab_persist import remote, backend, client
 
 
 class CheckpointTests(unittest.TestCase):
@@ -41,6 +41,55 @@ class CheckpointTests(unittest.TestCase):
         second = self.store.snapshot("demo")
         self.assertEqual(first["snapshot"], second["snapshot"])
         self.assertTrue(second["reused"])
+
+    def test_large_workspace_rejected_before_any_content_is_read(self):
+        (self.workspace / "accidental-dataset.bin").write_bytes(b"123456")
+        self.store.snapshot_limit = 5
+        with patch.object(remote, "digest") as hashing:
+            with self.assertRaisesRegex(RuntimeError, "size limit"):
+                self.store.snapshot("demo")
+            hashing.assert_not_called()
+
+    def test_snapshot_preserves_previous_generation_when_disk_is_full(self):
+        first = self.store.snapshot("demo")
+        (self.workspace / "changed").write_text("new")
+        with patch.object(remote.shutil, "disk_usage", return_value=SimpleNamespace(free=1)):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient scratch"):
+                self.store.snapshot("demo")
+        self.assertEqual(self.store.snapshots("demo")[0]["snapshot"], first["snapshot"])
+
+    def test_restore_checks_space_before_reading_archive(self):
+        self.store.snapshot("demo")
+        replacement = remote.Store(self.base / "vm2", self.mount)
+        with patch.object(remote.shutil, "disk_usage", return_value=SimpleNamespace(free=1)), \
+             patch.object(remote, "digest") as hashing:
+            with self.assertRaisesRegex(RuntimeError, "Insufficient scratch"):
+                replacement.restore("demo")
+            hashing.assert_not_called()
+
+    def test_failed_source_size_check_never_uploads(self):
+        source = self.base / "local-source"
+        source.mkdir()
+        (source / "train.py").write_text("pass")
+        (source / "large.data").write_bytes(b"123456")
+        with patch.object(backend, "config", return_value={"snapshot_limit_bytes": 5}), \
+             patch.object(backend.subprocess, "run") as command:
+            with self.assertRaisesRegex(RuntimeError, "size limit"):
+                backend.upload_source(object(), "demo", source / "train.py", source)
+            command.assert_not_called()
+
+    def test_data_and_model_caches_are_outside_snapshot(self):
+        script = self.workspace / "paths.py"
+        script.write_text("import os, pathlib\n"
+                          "for key in ('COLAB_DATASET_CACHE', 'HF_HOME'):\n"
+                          " p = pathlib.Path(os.environ[key]); p.mkdir(parents=True, exist_ok=True)\n"
+                          " (p / 'cached-weights.bin').write_text('disposable')\n"
+                          " print(str(p))\n")
+        with patch.dict(remote.os.environ, {}, clear=True):
+            result = self.store.run("demo", "paths.py", [], interval=10)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(any("cached-weights" in name for name in result["checkpoint"]["files"]))
+        self.assertTrue((self.base / "colab-persist-cache" / "huggingface" / "cached-weights.bin").exists())
 
     def test_corruption_cannot_be_restored(self):
         (self.workspace / "data").write_text("important")
@@ -124,6 +173,40 @@ class CheckpointTests(unittest.TestCase):
 
 
 class ShutdownTests(unittest.TestCase):
+    def test_changing_snapshot_cap_preserves_existing_runtime_and_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "custom-key"
+            key.write_text("test key fixture")
+            original = {"expected_email": "test@example.com", "gpu": "A100", "session": "training",
+                        "ssh_identity": str(key), "drive_folder": "Training", "ssh_alias_config": "custom.conf"}
+            remote.write_json(root / "config.json", original)
+            args = SimpleNamespace(email="test@example.com", gpu=None, session=None, key=None,
+                                   ssh_config=None, snapshot_limit_gib=8)
+            with patch.object(backend, "CONFIG_DIR", root), patch.object(client.subprocess, "run") as command:
+                client.configure(args)
+                command.assert_not_called()
+            self.assertEqual(json.loads((root / "config.json").read_text()),
+                             {**original, "snapshot_limit_bytes": 8 * remote.GIB})
+
+    def test_deployed_engine_can_import_dataset_and_checkpoint_helpers(self):
+        calls = []
+        with patch.object(backend, "ssh_command", return_value=["unused"]), \
+             patch.object(backend, "checked", side_effect=lambda args, **kw: calls.append(kw.get("data"))):
+            backend.install_engine(object())
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory).resolve()
+            with tarfile.open(fileobj=io.BytesIO(calls[0])) as archive:
+                archive.extractall(target, filter="data")
+            program = (f"import sys; sys.path.insert(0, {str(target)!r}); "
+                       "from colab_persist.datasets import ShardCache; "
+                       "from colab_persist.checkpoints import atomic_checkpoint; "
+                       "from colab_persist import remote; print(remote.__file__)")
+            result = backend.subprocess.run([sys.executable, "-I", "-c", program],
+                                            capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(target / "colab_persist" / "remote.py"))
+
     def test_mount_checks_filesystem_even_when_cli_returns_zero(self):
         with patch.object(backend, "operation_lock", side_effect=contextlib.nullcontext), \
              patch.object(backend, "require_session", return_value=SimpleNamespace(name="cuda")), \

@@ -19,7 +19,7 @@ import time
 from google.auth.transport.requests import AuthorizedSession
 from colab_cli.auth import AuthProvider, _get_adc_credentials
 from colab_cli.common import State
-from . import remote
+from . import datasets, remote
 
 CONFIG_DIR = Path.home() / ".config" / "colab-persist"
 REMOTE_ENGINE = "/content/.colab-persist/remote.py"
@@ -34,6 +34,9 @@ def config():
         raise RuntimeError("The configuration must specify expected_email.")
     remote.valid_name(value.get("session", "cuda"))
     remote.valid_name(value.get("drive_folder", "Colab-CUDA"))
+    limit = value.get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("snapshot_limit_bytes must be a positive integer.")
     return value
 
 
@@ -114,7 +117,8 @@ def ssh_command(item):
 
 def remote_call(operation, *, item=None, **parameters):
     item = item or require_session()
-    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"), **parameters}
+    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"),
+               "snapshot_limit": config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT), **parameters}
     raw = checked([*ssh_command(item), "python3 " + REMOTE_ENGINE],
                   data=json.dumps(request).encode(), timeout=900).decode(errors="replace")
     return parse_result(raw)
@@ -129,8 +133,10 @@ def parse_result(raw):
 
 
 def kernel_call(operation, *, item, timeout=900, **parameters):
-    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"), **parameters}
+    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"),
+               "snapshot_limit": config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT), **parameters}
     code = ("import importlib.util\n"
+            f"import sys; sys.path.insert(0, {str(Path(REMOTE_ENGINE).parent)!r})\n"
             f"_spec = importlib.util.spec_from_file_location('_persist_engine', {REMOTE_ENGINE!r})\n"
             "_engine = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(_engine)\n"
             f"_engine.dispatch({request!r})\n")
@@ -143,10 +149,16 @@ def kernel_call(operation, *, item, timeout=900, **parameters):
 
 
 def install_engine(item):
-    source = Path(remote.__file__).read_bytes()
+    source = io.BytesIO()
+    with tarfile.open(fileobj=source, mode="w") as archive:
+        archive.add(remote.__file__, arcname="remote.py")
+        package = Path(remote.__file__).parent
+        for name in ("__init__.py", "remote.py", "datasets.py", "checkpoints.py"):
+            archive.add(package / name, arcname="colab_persist/" + name)
     for attempt in range(3):
         try:
-            checked([*ssh_command(item), "mkdir -p /content/.colab-persist && cat > " + REMOTE_ENGINE], data=source)
+            checked([*ssh_command(item), "mkdir -p /content/.colab-persist && tar -xf - -C /content/.colab-persist"],
+                    data=source.getvalue())
             break
         except RuntimeError:
             if attempt == 2:
@@ -157,6 +169,8 @@ def install_engine(item):
 cat > /etc/profile.d/colab-cuda.sh <<'CUDA'
 export PATH="/usr/local/cuda/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/lib64-nvidia:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONPATH="/content/.colab-persist${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME="${HF_HOME:-/content/colab-persist-cache/huggingface}"
 CUDA
 python3 - <<'PY'
 from pathlib import Path
@@ -277,6 +291,12 @@ def restore(project, snapshot="latest"):
         return remote_call("restore", project=remote.valid_name(project), snapshot=snapshot)
 
 
+def dataset_plan(manifest_path, cache_gib=40, reserve_gib=20):
+    """Validate metadata locally, without allocating a GPU or reading shard contents."""
+    manifest = datasets.load_manifest(Path(manifest_path).expanduser())
+    return datasets.plan(manifest, cache_bytes=cache_gib * remote.GIB, reserve_bytes=reserve_gib * remote.GIB)
+
+
 def upload_source(item, project, script_path, source_directory=None):
     script = Path(script_path).expanduser().resolve(strict=True)
     if script.suffix != ".py" or not script.is_file():
@@ -287,7 +307,10 @@ def upload_source(item, project, script_path, source_directory=None):
     relative = script.relative_to(source)
     if remote.excluded(relative):
         raise ValueError("Script path matches a credential/cache exclusion.")
-    files = remote.inventory(source) if source_directory else {relative.as_posix(): {}}
+    limit = config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
+    if script.stat().st_size > limit:
+        raise RuntimeError("Script exceeds the source upload size limit.")
+    files = remote.inventory(source, limit) if source_directory else {relative.as_posix(): {}}
     with tempfile.TemporaryDirectory(prefix="colab-upload-") as temporary:
         archive = Path(temporary) / "source.tar.gz"
         with tarfile.open(archive, "w:gz") as target:
@@ -303,7 +326,7 @@ def upload_source(item, project, script_path, source_directory=None):
     code = ("import importlib.util\n"
             f"s=importlib.util.spec_from_file_location('engine',{REMOTE_ENGINE!r})\n"
             "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
-            f"m.extract_archive(m.Path({incoming!r}),m.Path({workspace!r}))\n")
+            f"m.extract_archive(m.Path({incoming!r}),m.Path({workspace!r}),{limit!r})\n")
     checked([*ssh_command(item), "python3 -"], data=code.encode())
     return relative.as_posix()
 

@@ -21,6 +21,17 @@ async def runtime_status() -> dict:
     return await perform(backend.status)
 
 
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+async def plan_dataset(manifest_path: str, cache_gib: int = 40, reserve_gib: int = 20) -> dict:
+    """Validate a local immutable shard manifest and size a bounded cache for large datasets.
+
+    Reads only the manifest, not the corpus. Does not provision a VM, contact Drive,
+    or confirm source files, VM free disk, Drive quota, throughput or GPU model fit.
+    Training scripts use colab_persist.datasets.ShardCache on the VM.
+    """
+    return await perform(backend.dataset_plan, manifest_path, cache_gib, reserve_gib)
+
+
 @mcp.tool()
 async def start_runtime(gpu: str | None = None) -> dict:
     """Provision or reuse the configured runtime. Default GPU is L4. Consumes Colab units.

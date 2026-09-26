@@ -30,23 +30,29 @@ def invoke(name, **arguments):
 def configure(args):
     if "@" not in args.email or any(c.isspace() for c in args.email):
         raise ValueError("Provide the Google email address you use for Colab and Drive.")
-    remote.valid_name(args.session)
+    if args.snapshot_limit_gib is not None and args.snapshot_limit_gib <= 0:
+        raise ValueError("Snapshot limit must be positive.")
     backend.CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = backend.CONFIG_DIR / "config.json"
     previous = json.loads(target.read_text()) if target.exists() else {}
-    key = Path(args.key).expanduser().absolute()
+    session = args.session or previous.get("session", "cuda")
+    gpu = args.gpu or previous.get("gpu", "L4")
+    remote.valid_name(session)
+    key = Path(args.key or previous.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser().absolute()
     if not key.exists():
         key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "colab-persist",
                         "-f", str(key)], check=True, stdout=subprocess.DEVNULL)
     key.chmod(0o600)
-    value = {**previous, "expected_email": args.email.lower(), "session": args.session,
-             "gpu": args.gpu, "ssh_identity": str(key), "drive_folder": "Colab-CUDA"}
+    value = {**previous, "expected_email": args.email.lower(), "session": session,
+             "gpu": gpu, "ssh_identity": str(key), "drive_folder": previous.get("drive_folder", "Colab-CUDA")}
+    if args.snapshot_limit_gib is not None:
+        value["snapshot_limit_bytes"] = args.snapshot_limit_gib * remote.GIB
     if args.ssh_config:
         value["ssh_alias_config"] = str(Path(args.ssh_config).expanduser().absolute())
     remote.write_json(target, value)
     target.chmod(0o600)
-    return {"configured": True, "config": str(target), "default_gpu": args.gpu}
+    return {"configured": True, "config": str(target), "default_gpu": gpu}
 
 
 def main():
@@ -54,10 +60,12 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     cfg = commands.add_parser("configure", help="Set the expected Google account and GPU preference")
     cfg.add_argument("--email", required=True)
-    cfg.add_argument("--gpu", default="L4", choices=["T4", "L4", "G4", "H100", "A100"])
-    cfg.add_argument("--session", default="cuda")
-    cfg.add_argument("--key", default="~/.ssh/id_ed25519_colab")
+    cfg.add_argument("--gpu", choices=["T4", "L4", "G4", "H100", "A100"], help="Preserve existing setting; initially L4")
+    cfg.add_argument("--session", help="Preserve existing setting; initially cuda")
+    cfg.add_argument("--key", help="Preserve existing key; initially ~/.ssh/id_ed25519_colab")
     cfg.add_argument("--ssh-config", help="Optional dedicated SSH config fragment to manage; include it from ~/.ssh/config")
+    cfg.add_argument("--snapshot-limit-gib", type=int,
+                     help="Workspace/source size cap before hashing (default 5 GiB); excludes external caches")
     start = commands.add_parser("start", help="Start/reuse the selected GPU and mount Drive")
     start.add_argument("--gpu", choices=["T4", "L4", "G4", "H100", "A100"])
     start.add_argument("--no-mount", action="store_true")
@@ -67,6 +75,10 @@ def main():
     commands.add_parser("save", help="Save all managed workspaces and flush/unmount Drive; keep the VM")
     commands.add_parser("stop", help="Save and flush Drive before stopping the VM")
     commands.add_parser("tools", help="List the real MCP tools")
+    dataset = commands.add_parser("dataset-plan", help="Validate a shard manifest and cache budget locally; no GPU allocation")
+    dataset.add_argument("manifest")
+    dataset.add_argument("--cache-gib", type=int, default=40)
+    dataset.add_argument("--reserve-gib", type=int, default=20)
     shell = commands.add_parser("ssh", help="Open SSH or run a remote command; no tmux")
     shell.add_argument("remote_command", nargs=argparse.REMAINDER)
     snapshots = commands.add_parser("snapshots")
@@ -92,6 +104,9 @@ def main():
             result = configure(args)
         elif args.command == "mount":
             result = backend.mount_drive()
+        elif args.command == "dataset-plan":
+            result = invoke("plan_dataset", manifest_path=str(Path(args.manifest).expanduser().absolute()),
+                            cache_gib=args.cache_gib, reserve_gib=args.reserve_gib)
         elif args.command in {"start", "run"}:
             result = invoke("start_runtime", gpu=args.gpu)
             print(f"Runtime {result['session']}: {result['gpu']}", file=sys.stderr)

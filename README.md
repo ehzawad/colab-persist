@@ -17,6 +17,12 @@ Colab L4: temporary workspace + CUDA execution
 Google Drive: Colab-CUDA/projects/<project>/
 ```
 
+For datasets larger than VM disk, use the separate manifest-driven shard cache:
+`colab-persist dataset-plan corpus.json`. It stages a bounded working set outside
+workspace snapshots. See [large datasets and LoRA](LARGE_DATA.md) for the 1 TB
+storage layout, checkpoint requirements, and current limits. Do not place a
+training corpus or base model cache inside the managed workspace.
+
 ## A complete run
 
 ```sh
@@ -114,6 +120,9 @@ The script runs with its project workspace as the current directory:
 |---|---|
 | `COLAB_WORKSPACE` | Temporary restored project directory |
 | `COLAB_OUTPUT_DIR` | Its `outputs/` directory, included in every checkpoint |
+| `COLAB_DATASET_ROOT` | Read-only source shards under Drive `Colab-CUDA/datasets/` |
+| `COLAB_DATASET_CACHE` | Disposable local shard cache, outside snapshots |
+| `HF_HOME` | Defaults to the external local Hugging Face cache if not already set |
 
 Scripts may invoke `nvcc`, `make`, profilers, or other commands. Store a dependency
 file and bootstrap script in the project and run them as needed after replacement;
@@ -143,6 +152,8 @@ the copied archive verifies. Incomplete uploads are ignored; unchanged snapshots
 are reused. Restore validates both the archive and extracted files, rejects links
 and path traversal, and refuses to overwrite a nonempty workspace. Checkpoints are
 retained until you choose to remove them from Drive; there is no automatic pruning.
+Workspace and source uploads default to a 5 GiB size cap checked before hashing;
+oversized saves refuse shutdown. Use the separate shard cache for large corpora.
 
 Periodic snapshots report `pending_drive_flush`. A successful final save reports
 `drive_flush_confirmed`, using Colab's `drive.flush_and_unmount()`. Save/stop refuses
@@ -176,7 +187,7 @@ codex mcp add colab-persist -- /absolute/path/to/colab-persist-mcp
 ```
 
 Tools: `runtime_status`, `start_runtime`, `prepare_workspace`, `run_script`,
-`list_checkpoints`, `restore_workspace`, `save_workspaces`, and `safe_stop`.
+`list_checkpoints`, `restore_workspace`, `save_workspaces`, `safe_stop`, and `plan_dataset`.
 The terminal client uses the same tools over real MCP stdio. `colab-persist tools`
 checks the connection. No HTTP port is exposed. Drive consent runs in a terminal,
 because OAuth codes should not be passed through a model conversation. Long jobs

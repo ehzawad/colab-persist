@@ -21,6 +21,9 @@ import uuid
 EXCLUDED = {".git", ".venv", "venv", "__pycache__", ".ssh", ".config",
             ".codex", ".claude", ".gemini", "node_modules", ".DS_Store"}
 RESULT_PREFIX = "COLAB_PERSIST_RESULT="
+GIB = 1024 ** 3
+DEFAULT_SNAPSHOT_LIMIT = 5 * GIB
+DEFAULT_DISK_RESERVE = 2 * GIB
 
 
 def valid_name(value: str) -> str:
@@ -52,9 +55,9 @@ def write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def inventory(root: Path) -> dict:
+def inventory(root: Path, max_bytes: int | None = None) -> dict:
     """Only regular files inside the workspace; never follow symbolic links."""
-    result = {}
+    result, candidates, total = {}, [], 0
     for directory, names, files in os.walk(root, followlinks=False):
         names[:] = sorted(n for n in names if not excluded(Path(directory, n).relative_to(root))
                           and not Path(directory, n).is_symlink())
@@ -66,19 +69,28 @@ def inventory(root: Path) -> dict:
             before = path.stat()
             if not stat.S_ISREG(before.st_mode):
                 continue
-            sha = digest(path)
-            after = path.stat()
-            if (before.st_size, before.st_mtime_ns, before.st_ino) != (
-                    after.st_size, after.st_mtime_ns, after.st_ino):
-                raise RuntimeError(f"File changed during checkpoint: {relative}. Retry after its writer finishes.")
-            result[relative.as_posix()] = {"size": before.st_size, "sha256": sha,
-                                           "mode": stat.S_IMODE(before.st_mode)}
+            total += before.st_size
+            if max_bytes is not None and total > max_bytes:
+                raise RuntimeError("Workspace/source exceeds the snapshot size limit. Keep datasets and base "
+                                   "model caches outside the workspace; use the bounded dataset cache.")
+            candidates.append((path, relative, before))
+    # Complete the metadata size check before hashing even the first large file.
+    for path, relative, before in candidates:
+        sha = digest(path)
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+                after.st_size, after.st_mtime_ns, after.st_ino):
+            raise RuntimeError(f"File changed during checkpoint: {relative}. Retry after its writer finishes.")
+        result[relative.as_posix()] = {"size": before.st_size, "sha256": sha,
+                                       "mode": stat.S_IMODE(before.st_mode)}
     return result
 
 
-def extract_archive(archive: Path, target: Path) -> None:
+def extract_archive(archive: Path, target: Path, max_bytes: int | None = None) -> None:
     with tarfile.open(archive, "r:gz") as source:
         members = source.getmembers()
+        if max_bytes is not None and sum(m.size for m in members) > max_bytes:
+            raise RuntimeError("Archive contents exceed the snapshot size limit.")
         for member in members:
             relative = PurePosixPath(member.name)
             if relative.is_absolute() or ".." in relative.parts or not (member.isfile() or member.isdir()):
@@ -87,10 +99,14 @@ def extract_archive(archive: Path, target: Path) -> None:
 
 
 class Store:
-    def __init__(self, scratch="/content/colab-persist", mount="/content/drive", folder="Colab-CUDA"):
+    def __init__(self, scratch="/content/colab-persist", mount="/content/drive", folder="Colab-CUDA",
+                 snapshot_limit=DEFAULT_SNAPSHOT_LIMIT):
         self.scratch = Path(scratch)
         self.mount = Path(mount)
         self.root = self.mount / "MyDrive" / valid_name(folder) / "projects"
+        if type(snapshot_limit) is not int or snapshot_limit <= 0:
+            raise ValueError("snapshot_limit must be a positive byte count.")
+        self.snapshot_limit = snapshot_limit
 
     def require_drive(self):
         if not os.path.ismount(self.mount) or not (self.mount / "MyDrive").is_dir():
@@ -128,7 +144,7 @@ class Store:
         workspace = self.workspace(project)
         if not workspace.is_dir():
             raise RuntimeError(f"Workspace {project} has not been prepared.")
-        files = inventory(workspace)
+        files = inventory(workspace, self.snapshot_limit)
         previous = self.snapshots(project)
         if previous and previous[0]["files"] == files:
             archive = self.root / project / (previous[0]["snapshot"] + ".tar.gz")
@@ -138,6 +154,10 @@ class Store:
         identifier = stamp + "-" + uuid.uuid4().hex[:8]
         destination = self.root / project
         destination.mkdir(parents=True, exist_ok=True)
+        # gzip can grow incompressible input; allow headers plus a free-disk reserve.
+        required = int(sum(f["size"] for f in files.values()) * 1.02) + len(files) * 4096
+        if shutil.disk_usage(self.scratch).free < required + DEFAULT_DISK_RESERVE:
+            raise RuntimeError("Insufficient scratch disk for a workspace archive and the 2 GiB reserve.")
         with tempfile.TemporaryDirectory(prefix="checkpoint-", dir=self.scratch) as temporary:
             archive = Path(temporary) / (identifier + ".tar.gz")
             with tarfile.open(archive, "w:gz", compresslevel=1) as target:
@@ -179,6 +199,12 @@ class Store:
             manifest = next((s for s in choices if s["snapshot"] == snapshot), None)
         if manifest is None:
             raise RuntimeError("No completed snapshot found.")
+        restored_size = sum(f["size"] for f in manifest["files"].values())
+        if restored_size > self.snapshot_limit:
+            raise RuntimeError("Checkpoint exceeds the configured snapshot size limit; review its contents first.")
+        workspace.parent.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(workspace.parent).free < restored_size + DEFAULT_DISK_RESERVE:
+            raise RuntimeError("Insufficient scratch disk to restore the checkpoint and retain the 2 GiB reserve.")
         archive = self.root / project / (manifest["snapshot"] + ".tar.gz")
         if digest(archive) != manifest["archive_sha256"]:
             raise RuntimeError("Checkpoint archive checksum mismatch; restore aborted.")
@@ -186,8 +212,8 @@ class Store:
         with tempfile.TemporaryDirectory(prefix="restore-", dir=workspace.parent) as temporary:
             staging = Path(temporary) / "workspace"
             staging.mkdir()
-            extract_archive(archive, staging)
-            if inventory(staging) != manifest["files"]:
+            extract_archive(archive, staging, self.snapshot_limit)
+            if inventory(staging, self.snapshot_limit) != manifest["files"]:
                 raise RuntimeError("Restored files do not match the checkpoint manifest.")
             if workspace.exists():
                 workspace.rmdir()  # Empty only; never removes user files.
@@ -239,6 +265,12 @@ class Store:
             env = os.environ.copy()
             env["COLAB_WORKSPACE"] = str(workspace)
             env["COLAB_OUTPUT_DIR"] = str(workspace / "outputs")
+            cache = self.scratch.parent / "colab-persist-cache"
+            cache.mkdir(parents=True, exist_ok=True)
+            env["COLAB_DATASET_ROOT"] = str(self.root.parent / "datasets")
+            env["COLAB_DATASET_CACHE"] = str(cache / "datasets")
+            env.setdefault("HF_HOME", str(cache / "huggingface"))
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(__file__).parent), env.get("PYTHONPATH")]))
             failures = []
             with log.open("ab", buffering=0) as output:
                 process = subprocess.Popen([sys.executable, "-u", str(entry), *arguments],
@@ -282,7 +314,7 @@ class Store:
             if not os.path.ismount(self.mount) and receipt_path.exists():
                 receipt = json.loads(receipt_path.read_text())
                 saved = {item["project"]: item["files"] for item in receipt["checkpoints"]}
-                if set(projects) == set(saved) and all(inventory(self.workspace(p)) == saved[p] for p in projects):
+                if set(projects) == set(saved) and all(inventory(self.workspace(p), self.snapshot_limit) == saved[p] for p in projects):
                     return receipt
                 raise RuntimeError("Workspace changed after Drive was flushed. Remount Drive before stopping.")
             self.require_drive()
@@ -291,7 +323,7 @@ class Store:
             drive.flush_and_unmount(timeout_ms=300_000)
             if os.path.ismount(self.mount):
                 raise RuntimeError("Drive is still mounted after flush; shutdown refused.")
-            if any(inventory(self.workspace(item["project"])) != item["files"] for item in checkpoints):
+            if any(inventory(self.workspace(item["project"]), self.snapshot_limit) != item["files"] for item in checkpoints):
                 raise RuntimeError("Workspace changed while Drive was flushing. Remount and save again; shutdown refused.")
             receipt = {"drive_flushed": True, "checkpoints": checkpoints,
                        "flushed_at": datetime.now(timezone.utc).isoformat()}
@@ -303,7 +335,8 @@ class Store:
 
 
 def dispatch(request):
-    store = Store(folder=request.pop("folder", "Colab-CUDA"))
+    store = Store(folder=request.pop("folder", "Colab-CUDA"),
+                  snapshot_limit=request.pop("snapshot_limit", DEFAULT_SNAPSHOT_LIMIT))
     operation = request.pop("operation")
     if operation not in {"status", "prepare", "snapshot", "snapshots", "restore", "run", "seal"}:
         raise ValueError("Unsupported persistence operation.")

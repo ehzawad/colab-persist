@@ -3,7 +3,27 @@
 Tested on macOS with Python 3.14.7, Google Colab CLI 0.7.4, MCP Python SDK 2.2.0,
 and NVIDIA L4 Colab runtimes on 2026-09-27 (Asia/Dhaka).
 
-## Automated checks
+## Version 0.2.0 storage checks
+
+On 2026-09-27, all **54 tests** passed in an isolated Python 3.14.7 environment.
+The wheel and source distribution built successfully. This adds verification of:
+
+- Bounded shard staging, eviction and cross-process active-reader protection.
+- Interrupted copy cleanup, source mutation, corruption and low-disk failures.
+- Manifest path validation, symlink/hardlink rejection and source/cache separation.
+- A synthetic 1 TB manifest through the real MCP tool. Only metadata was processed;
+  no terabyte dataset was created or transferred.
+- Atomic publication of required checkpoint files, excluding incomplete generations.
+- Workspace/source size caps, restore headroom and deployed runtime module imports.
+- Preserving existing GPU/session/key configuration when changing only the size cap.
+
+These new storage paths have not been exercised against a live terabyte-scale
+Drive corpus, a Qwen trainer, or an abrupt Colab termination. The runtime deployment
+archive was imported in an isolated local process; no GPU was allocated for this
+update. LoRA fit, throughput and complete optimizer/data-loader recovery remain
+application-level tests to perform with an actual dataset and training recipe.
+
+## Version 0.1.0 automated checks
 
 - 17 local tests passed, including a real stdio MCP client/server handshake.
 - Wheel and source distribution built successfully.
