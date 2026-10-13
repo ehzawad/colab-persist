@@ -333,19 +333,28 @@ def status():
                 "session": item.name, "endpoint": item.endpoint, **remote_call("status", item=item)}
 
 
+# Colab's first drive.mount() right after a fresh consent often fails ("ValueError: mount failed")
+# while the new credentials propagate; a later attempt with the same authorization succeeds.
+MOUNT_ATTEMPTS, MOUNT_RETRY_PAUSE_S = 3, 5
+
+
 def mount_drive():
     """Terminal-only consent flow. Never read OAuth codes through MCP/chat."""
     with operation_lock():
         item = require_session()
         if remote_call("status", item=item)["drive_mounted"]:
             return {"drive_mounted": True}
-        for attempt in range(2):
+        for attempt in range(MOUNT_ATTEMPTS):
             completed = subprocess.run([*colab_command(), "drivemount", "-s", item.name],
                                        env=accounts.environment(config()))
             if completed.returncode == 0 and remote_call("status", item=item)["drive_mounted"]:
                 return {"drive_mounted": True}
-            if attempt == 0:
-                print("Drive did not finish mounting; retrying once using the completed authorization.", file=sys.stderr)
+            if attempt + 1 < MOUNT_ATTEMPTS:
+                print("Drive did not finish mounting. A 'ValueError: mount failed' traceback just after consent is "
+                      "Colab's first mount racing the new credentials, not a problem with your authorization. "
+                      f"Retrying in {MOUNT_RETRY_PAUSE_S} s with the completed authorization "
+                      f"(attempt {attempt + 2} of {MOUNT_ATTEMPTS}).", file=sys.stderr)
+                time.sleep(MOUNT_RETRY_PAUSE_S)
         raise RuntimeError("Drive mount did not complete. Run `colab-persist mount` again.")
 
 

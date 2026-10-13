@@ -214,6 +214,7 @@ class ShutdownTests(unittest.TestCase):
              patch.object(backend, "colab_command", return_value=["unused"]), \
              patch.object(backend, "remote_call", side_effect=[
                  {"drive_mounted": False}, {"drive_mounted": False}, {"drive_mounted": True}]), \
+             patch.object(backend.time, "sleep"), \
              patch.object(backend.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as command:
             self.assertTrue(backend.mount_drive()["drive_mounted"])
             self.assertEqual(command.call_count, 2)
