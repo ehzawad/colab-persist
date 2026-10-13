@@ -123,9 +123,10 @@ to use their current ADC login until `login` is explicitly run. A dedicated Ed25
 key is created only if the selected key does not exist. None of these files are
 uploaded by this tool.
 
-If Colab's initial Drive mount fails immediately after consent, the helper retries
-once and verifies the actual mount. A failed mount never becomes an ordinary local
-directory masquerading as persistent storage.
+Colab's first Drive mount right after consent often fails with `ValueError: mount failed`
+while the new credentials propagate. The helper says so, pauses briefly and retries with
+the completed authorization (up to three attempts), verifying the actual mount each time.
+A failed mount never becomes an ordinary local directory masquerading as persistent storage.
 
 ## Accounts and the official CLI
 
