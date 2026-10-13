@@ -21,6 +21,7 @@ import uuid
 EXCLUDED = {".git", ".venv", "venv", "__pycache__", ".ssh", ".config",
             ".codex", ".claude", ".gemini", "node_modules", ".DS_Store"}
 RESULT_PREFIX = "COLAB_PERSIST_RESULT="
+ERROR_PREFIX = "COLAB_PERSIST_ERROR="
 GIB = 1024 ** 3
 DEFAULT_SNAPSHOT_LIMIT = 5 * GIB
 DEFAULT_DISK_RESERVE = 2 * GIB
@@ -305,8 +306,14 @@ class Store:
                     "log_tail": tail, "periodic_checkpoint_errors": failures[-10:]}
 
     def seal(self):
-        """Checkpoint every managed workspace, then push Drive writes before allowing shutdown."""
+        """Checkpoint every managed workspace, then push Drive writes before allowing shutdown.
+
+        With no managed workspace and Drive not mounted there is nothing to save and no Drive
+        write can be pending, so the receipt says so instead of refusing the shutdown."""
         projects = list(self.status()["workspaces"])
+        if not projects and not os.path.ismount(self.mount):
+            return {"drive_flushed": False, "nothing_to_save": True, "checkpoints": [],
+                    "checked_at": datetime.now(timezone.utc).isoformat()}
         with contextlib.ExitStack() as stack:
             for project in projects:
                 stack.enter_context(self.project_lock(project))
@@ -335,16 +342,23 @@ class Store:
 
 
 def dispatch(request):
-    store = Store(folder=request.pop("folder", "Colab-CUDA"),
-                  snapshot_limit=request.pop("snapshot_limit", DEFAULT_SNAPSHOT_LIMIT))
-    operation = request.pop("operation")
-    if operation not in {"status", "prepare", "snapshot", "snapshots", "restore", "run", "seal"}:
-        raise ValueError("Unsupported persistence operation.")
-    if operation in {"snapshot", "restore"}:
-        with store.project_lock(request["project"]):
+    operation = request.get("operation")
+    try:
+        store = Store(folder=request.pop("folder", "Colab-CUDA"),
+                      snapshot_limit=request.pop("snapshot_limit", DEFAULT_SNAPSHOT_LIMIT))
+        operation = request.pop("operation")
+        if operation not in {"status", "prepare", "snapshot", "snapshots", "restore", "run", "seal"}:
+            raise ValueError("Unsupported persistence operation.")
+        if operation in {"snapshot", "restore"}:
+            with store.project_lock(request["project"]):
+                result = getattr(store, operation)(**request)
+        else:
             result = getattr(store, operation)(**request)
-    else:
-        result = getattr(store, operation)(**request)
+    except Exception as error:
+        # The local side reports this reason instead of only "no result".
+        print(ERROR_PREFIX + json.dumps({"operation": operation, "error": str(error),
+                                         "type": type(error).__name__}), flush=True)
+        raise
     print(RESULT_PREFIX + json.dumps(result), flush=True)
     return result
 
