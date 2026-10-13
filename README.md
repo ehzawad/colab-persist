@@ -226,6 +226,13 @@ work normally. Host keys are pinned separately for each runtime endpoint. Starti
 a replacement refreshes this alias; connecting to an old endpoint fails rather
 than quietly connecting to another VM.
 
+Colab accepts one SSH session per runtime. colab-persist and the `colab-cuda` alias therefore
+share one connection per runtime: an SSH control master at `~/.ssh/cm-colab-<endpoint>`.
+- **Running side by side:** `ssh colab-cuda`, `rsync` and colab-persist's own commands can run at the same time.
+- **Lingering connection:** an interactive connection stays open for 5 minutes after its last session, and one that colab-persist opened stays open for 30 seconds.
+- **Native `colab ssh`:** it does not join the shared connection. To give it the runtime, close the shared one first with `ssh -O exit colab-cuda`.
+- **The busy-session error:** that same command is the fix when colab-persist reports that another client holds the runtime's SSH session.
+
 Select another GPU explicitly when starting a fresh runtime:
 
 ```sh
@@ -352,6 +359,10 @@ Periodic snapshots report `pending_drive_flush`. A successful final save reports
 while a managed script is running. If Drive is unavailable, full, or cannot flush,
 the operation fails and leaves the VM allocated for recovery. Fix the problem and
 retry `stop`; do not bypass it unless you accept losing unsaved work.
+
+A runtime with no managed workspace and Drive not mounted has nothing to save, and no Drive
+write can be pending. `stop` shuts it down and reports `nothing_to_save: true` instead of
+refusing. As with every stop, files outside managed workspaces are not captured.
 
 `run --keep-runtime` flushes Drive but leaves the GPU allocated. Remount Drive before
 another save. Direct `colab stop`, the Colab browser's Delete Runtime action, and

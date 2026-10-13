@@ -89,6 +89,8 @@ async def safe_stop() -> dict:
 
     Unmanaged processes and files outside the workspace are not captured. Saving failures
     leave the VM running so the user can recover. Refuses while managed jobs are active.
+    With no managed workspace and Drive not mounted there is nothing to save; the VM stops
+    and the result reports nothing_to_save: true.
     """
     return await perform(backend.save_and_stop, stop=True)
 

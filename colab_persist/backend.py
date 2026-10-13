@@ -22,6 +22,8 @@ from . import accounts, datasets, remote, session_state
 
 CONFIG_DIR = Path.home() / ".config" / "colab-persist"
 REMOTE_ENGINE = "/content/.colab-persist/remote.py"
+SSH_CONTROL_DIR = Path.home() / ".ssh"
+SSH_BUSY = ("Already-active SSH session", "HTTP 429")
 
 
 def config():
@@ -131,6 +133,11 @@ def checked(arguments, *, data=None, timeout=180, env=None):
                             timeout=timeout, env=env)
     if result.returncode:
         detail = (result.stderr + result.stdout).decode(errors="replace")[-4000:]
+        if any(marker in detail for marker in SSH_BUSY):
+            raise RuntimeError(
+                "Colab accepts one SSH session per runtime and another client holds it: an interactive "
+                "SSH, a native `colab ssh`, or another tool's open connection. Close it and retry; a "
+                "multiplexed `ssh colab-cuda` connection closes with `ssh -O exit colab-cuda`.\n" + detail[-500:])
         raise RuntimeError(f"Command failed ({result.returncode}): {detail}")
     return result.stdout
 
@@ -162,6 +169,13 @@ def require_session():
     return item
 
 
+def control_path(item):
+    """One SSH connection per runtime, shared by colab-persist and the `colab-cuda` alias. Colab
+    accepts a single SSH session per runtime, so separate connections would refuse each other
+    (HTTP 429); multiplexed sessions ride on whichever connection is already open."""
+    return SSH_CONTROL_DIR / ("cm-colab-" + item.endpoint)
+
+
 def ssh_command(item):
     cfg = config()
     key = str(Path(cfg.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser())
@@ -171,6 +185,10 @@ def ssh_command(item):
             "-o", "ServerAliveCountMax=3", "-o", "ForwardAgent=no",
             "-o", "UserKnownHostsFile=" + str(Path.home() / ".ssh/known_hosts_colab_persist"),
             "-o", "HostKeyAlias=colab-" + item.endpoint,
+            # A backgrounded master (ControlPersist) lets this command return even while an
+            # interactive session multiplexes on the same connection; it lingers 30 s after the last.
+            "-o", "ControlMaster=auto", "-o", "ControlPath=" + str(control_path(item)),
+            "-o", "ControlPersist=30",
             "-o", "ProxyCommand=" + proxy, "root@colab-runtime"]
 
 
@@ -180,14 +198,22 @@ def remote_call(operation, *, item=None, **parameters):
                "snapshot_limit": config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT), **parameters}
     raw = checked([*ssh_command(item), "python3 " + REMOTE_ENGINE],
                   data=json.dumps(request).encode(), timeout=900).decode(errors="replace")
-    return parse_result(raw)
+    return parse_result(raw, operation)
 
 
-def parse_result(raw):
+def parse_result(raw, operation=None):
     results = [line[len(remote.RESULT_PREFIX):] for line in raw.splitlines()
                if line.startswith(remote.RESULT_PREFIX)]
     if not results:
-        raise RuntimeError("No confirmed completion receipt was returned. Runtime was NOT stopped.\n" + raw[-2000:])
+        errors = [line[len(remote.ERROR_PREFIX):] for line in raw.splitlines()
+                  if line.startswith(remote.ERROR_PREFIX)]
+        reason = ""
+        if errors:
+            with contextlib.suppress(ValueError, KeyError, TypeError):
+                reason = ": " + json.loads(errors[-1])["error"]
+        name = f"Remote operation {operation!r}" if operation else "The remote operation"
+        stopped = " Runtime was NOT stopped." if operation == "seal" else ""
+        raise RuntimeError(f"{name} returned no confirmed result{reason}.{stopped}\n" + raw[-2000:])
     return json.loads(results[-1])
 
 
@@ -205,7 +231,7 @@ def kernel_call(operation, *, item, timeout=900, **parameters):
         raw = checked([*colab_command(), "exec", "-s", item.name, "-f", str(script),
                        "--timeout", str(timeout)], timeout=timeout + 60,
                       env=accounts.environment(config())).decode(errors="replace")
-    return parse_result(raw)
+    return parse_result(raw, operation)
 
 
 def install_engine(item):
@@ -265,6 +291,9 @@ Host colab-cuda
   ServerAliveInterval 30
   ServerAliveCountMax 3
   ForwardAgent no
+  ControlMaster auto
+  ControlPath "{control_path(item)}"
+  ControlPersist 5m
 ''')
     target.chmod(0o600)
 
@@ -328,17 +357,22 @@ def save_and_stop(*, stop=True):
 
 def _save_and_stop(item, stop):
     receipt = kernel_call("seal", item=item)
-    if not receipt.get("drive_flushed"):
+    # nothing_to_save: no managed workspace and Drive not mounted, so no managed data or pending
+    # Drive write can be lost. Unmanaged files are never captured, as in every other stop.
+    nothing = bool(receipt.get("nothing_to_save"))
+    if not receipt.get("drive_flushed") and not nothing:
         raise RuntimeError("Drive did not confirm its flush. Shutdown refused.")
-    # Keep a small local receipt for diagnosis; the data itself lives in Drive.
-    remote.write_json(CONFIG_DIR / "last-save.json", receipt)
-    (CONFIG_DIR / "last-save.json").chmod(0o600)
+    if not nothing:
+        # Keep a small local receipt for diagnosis; the data itself lives in Drive.
+        remote.write_json(CONFIG_DIR / "last-save.json", receipt)
+        (CONFIG_DIR / "last-save.json").chmod(0o600)
     if stop:
         if require_session().endpoint != item.endpoint:
             raise RuntimeError("Runtime changed during saving. Refusing to stop a different VM.")
         checked([*colab_command(), "stop", "-s", item.name], timeout=180,
                 env=accounts.environment(config()))
-    return {"stopped": stop, "drive_flushed": True, "flushed_at": receipt["flushed_at"],
+    return {"stopped": stop, "drive_flushed": bool(receipt.get("drive_flushed")), "nothing_to_save": nothing,
+            "flushed_at": receipt.get("flushed_at"),
             "checkpoints": [checkpoint_summary(s) for s in receipt["checkpoints"]]}
 
 
