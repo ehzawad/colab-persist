@@ -390,16 +390,77 @@ class CommitOrderTests(StoreCase):
         fresh = self.store.snapshot("demo")
         self.assertFalse(fresh["reused"])
 
-    def test_duplicate_project_folders_stop_before_any_upload(self):
+    def test_duplicate_project_folders(self):
         (self.workspace / "data").write_text("v1")
         self.store.snapshot("demo")
         self.drive.add_duplicate_folder(PROJECT)
         (self.workspace / "data").write_text("v2")
+        # This VM remembers the folder it created and keeps writing there.
+        self.store.snapshot("demo")
+        self.assertEqual(len(self.drive.upload_names()), 4)
+        # A VM without that memory refuses to guess between two same-named folders.
         with self.assertRaisesRegex(drive_api.DuplicateFolder, "Merge or rename"):
-            self.store.snapshot("demo")
-        self.assertEqual(len(self.drive.upload_names()), 2)
-        with self.assertRaises(drive_api.DuplicateFolder):
             self.replacement().prepare("demo")
+
+    def test_listing_lag_never_creates_a_second_folder(self):
+        fresh = self.replacement("vm-lag")
+        workspace = fresh.workspace("lagged")
+        workspace.mkdir(parents=True)
+        (workspace / "a.txt").write_text("one")
+        self.drive.lag = True
+        fresh.snapshot("lagged")
+        (workspace / "a.txt").write_text("two")
+        fresh.snapshot("lagged")
+        self.drive.settle()
+        projects = self.drive.resolve(["Colab-Persist", "projects"])
+        self.assertEqual(len(self.drive.children(projects, name="lagged", folders=True)), 1)
+
+    def test_a_replacement_vm_finds_the_newest_pair_through_the_known_ids(self):
+        (self.workspace / "data").write_text("v1")
+        self.store.snapshot("demo")
+        self.drive.lag = True
+        (self.workspace / "data").write_text("v2")
+        newest = self.store.snapshot("demo")
+        known = {"snapshot": newest["snapshot"], "manifest_file_id": newest["manifest_file_id"],
+                 "archive_file_id": newest["archive_file_id"]}
+        restored = self.replacement("vm-known").prepare("demo", known=known)
+        self.assertEqual(restored["restored"]["snapshot"], newest["snapshot"])
+
+    def test_reuse_refuses_a_pair_that_is_no_longer_intact(self):
+        (self.workspace / "data").write_text("stable")
+        first = self.store.snapshot("demo")
+        self.drive.trash(first["manifest_file_id"])
+        second = self.store.snapshot("demo")
+        self.assertFalse(second["reused"])
+        self.assertNotEqual(second["snapshot"], first["snapshot"])
+
+    def test_reuse_requires_drives_sha256(self):
+        (self.workspace / "data").write_text("stable")
+        self.drive.report_sha256 = False
+        first = self.store.snapshot("demo")
+        second = self.store.snapshot("demo")
+        self.assertFalse(second["reused"])
+        self.assertNotEqual(second["snapshot"], first["snapshot"])
+
+    def test_hard_linked_files_are_archived_as_regular_files(self):
+        (self.workspace / "one.bin").write_bytes(b"same inode")
+        os.link(self.workspace / "one.bin", self.workspace / "two.bin")
+        saved = self.store.snapshot("demo")
+        restored = self.replacement("vm-links").prepare("demo")
+        self.assertEqual(restored["restored"]["snapshot"], saved["snapshot"])
+        workspace = self.replacement("vm-links").workspace("demo")
+        self.assertEqual((workspace / "two.bin").read_bytes(), b"same inode")
+
+    def test_an_empty_workspace_restores_and_never_supersedes_a_checkpoint(self):
+        (self.workspace / "data").write_text("real work")
+        saved = self.store.snapshot("demo")
+        fresh = self.replacement("vm-empty")
+        (fresh.workspace("demo") / "outputs").mkdir(parents=True)  # As a plain `start` leaves it.
+        receipt = fresh.seal()
+        self.assertEqual(receipt.get("skipped_empty"), ["demo"])
+        self.assertTrue(receipt["nothing_to_save"])
+        restored = fresh.prepare("demo")
+        self.assertEqual(restored["restored"]["snapshot"], saved["snapshot"])
 
     def test_list_after_write_lag_is_recovered_through_last_upload(self):
         (self.workspace / "data").write_text("v1")
@@ -543,7 +604,8 @@ class LegacyTests(StoreCase):
 
         again = store.import_legacy()
         self.assertEqual(again["imported"], [])
-        self.assertEqual(again["skipped"], [{"project": "demo", "snapshot": newest["snapshot"]}])
+        self.assertEqual([(i["project"], i["snapshot"]) for i in again["skipped"]], [("demo", newest["snapshot"])])
+        self.assertTrue(again["skipped"][0]["manifest_file_id"] and again["skipped"][0]["archive_file_id"])
         self.assertEqual(len(self.drive.upload_names()), before + 2)
 
         everything = store.import_legacy(all_snapshots=True)
@@ -551,6 +613,18 @@ class LegacyTests(StoreCase):
         replacement = self.replacement()
         replacement.prepare("demo")
         self.assertEqual((replacement.workspace("demo") / "outputs" / "model.bin").read_bytes(), b"better" * 100)
+
+    def test_import_repairs_a_broken_destination_marker(self):
+        newest, archive, path = v03_checkpoint(self.legacy_projects / "demo", self.old_workspace, "demo",
+                                               "20250601T120000000000Z-00000002")
+        store = self.legacy_store()
+        imported = store.import_legacy()["imported"][0]
+        self.drive.corrupt(imported["manifest_file_id"], b"{not json")
+        report = store.import_legacy()
+        self.assertEqual(report["skipped"], [])
+        self.assertEqual([r["snapshot"] for r in report["repaired"]], [newest["snapshot"]])
+        replacement = self.replacement()
+        self.assertEqual(replacement.prepare("demo")["restored"]["snapshot"], newest["snapshot"])
 
     def test_import_requires_the_legacy_mount(self):
         v03_checkpoint(self.legacy_projects / "demo", self.old_workspace, "demo", "20250601T120000000000Z-00000002")

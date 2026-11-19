@@ -105,6 +105,24 @@ class StartRuntimeTests(BackendFixture, unittest.TestCase):
         self.assertEqual(colab_api.runtime_id_of(runtime), runtime_id)
         self.assertEqual(runtimes.entry(self.config_dir, EMAIL, "cuda")["state"], "ready")
 
+    def test_a_listing_miss_is_confirmed_by_id_before_forgetting(self):
+        runtime = self.managed()
+        self.api.list_error = None
+        with patch.object(self.api, "list_runtimes", return_value=[]):
+            found, _, _ = backend.managed_runtime(backend.config(), self.api)
+        self.assertEqual(colab_api.runtime_id_of(found), colab_api.runtime_id_of(runtime))
+        self.assertEqual(runtimes.entry(self.config_dir, EMAIL, "cuda")["state"], "ready")
+
+    def test_a_runtime_without_connection_details_stays_pending(self):
+        record = runtimes.begin(self.config_dir, EMAIL, "cuda", fakes.GPU_L4)
+        starting = fakes.make_runtime(record["runtime_id"], fakes.GPU_L4)
+        starting.pop("connectionInfo", None)
+        self.api.runtimes.append(starting)
+        found, _, pending = backend.managed_runtime(backend.config(), self.api)
+        self.assertIsNone(found)
+        self.assertEqual(pending["runtime_id"], record["runtime_id"])
+        self.assertEqual(runtimes.entry(self.config_dir, EMAIL, "cuda")["state"], "pending")
+
     def test_unmanaged_runtimes_are_never_adopted(self):
         self.api.runtimes.append(fakes.make_runtime("browser-notebook-1", fakes.GPU_L4))
         result = backend.start_runtime()

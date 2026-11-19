@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 
@@ -121,10 +122,16 @@ def api_for(cfg, credentials=None):
 
 def drive_token(cfg):
     """A cached short-lived Drive token; refreshed when less than 15 minutes remain."""
-    key = (cfg["expected_email"], cfg["drive_folder"])
+    path = accounts.credentials_path(cfg)
+    stamp = path.stat().st_mtime_ns if path and path.exists() else None
+    # A long-running MCP server must notice a reauth, a new project or a scope change made elsewhere.
+    key = (cfg["expected_email"], cfg["drive_folder"], quota_project(cfg), full_drive(cfg), str(path), stamp)
     token = _TOKENS.get(key)
     if not token or token["expires_at"] - time.time() < TOKEN_MARGIN_SECONDS:
         token = accounts.drive_token(cfg, quota_project(cfg), cfg["drive_folder"], full_drive=full_drive(cfg))
+        # Every token that reaches the VM is first proven to belong to the selected account.
+        check_drive_identity(cfg, drive_api.DriveClient(drive_api.TokenSource(token["token"],
+                                                                               token["quota_project"])))
         _TOKENS[key] = token
     return dict(token)
 
@@ -150,31 +157,37 @@ def identity():
 
 
 # -- accounts --------------------------------------------------------------------------
+def _service_disabled(error):
+    reason = getattr(error, "reason", None)
+    return reason in ("SERVICE_DISABLED", "accessNotConfigured") or "SERVICE_DISABLED" in str(error)
+
+
+def _after_enabling(api, project, check, attempts=12):
+    """Run a check, enabling the two free APIs and waiting for them to take effect if needed."""
+    enabled = False
+    for attempt in range(attempts):
+        try:
+            return check()
+        except (colab_api.ColabAPIError, drive_api.DriveError) as error:
+            if not _service_disabled(error) or attempt == attempts - 1:
+                raise
+            if not enabled:
+                api.enable_services(project)  # First use of this project.
+                enabled = True
+            time.sleep(5)  # Newly enabled APIs can take a minute to take effect.
+
+
 def verify_account(cfg, project):
     credentials = accounts.verified_credentials(cfg)
     result = {"account": cfg["expected_email"], "account_verified": True}
     if not project:
         return {**result, "drive_ready": False, "next": "colab-persist setup --project YOUR_PROJECT_ID"}
     api = colab_api.ColabAPI(credentials, project)
-    try:
-        listed = api.list_runtimes()
-    except colab_api.ColabAPIError as error:
-        if error.reason != "SERVICE_DISABLED":
-            raise
-        api.enable_services(project)  # First use of this project: enable the two free APIs.
-        for attempt in range(12):  # Newly enabled APIs can take a minute to take effect.
-            try:
-                listed = api.list_runtimes()
-                break
-            except colab_api.ColabAPIError as retry_error:
-                if retry_error.reason != "SERVICE_DISABLED" or attempt == 11:
-                    raise
-                time.sleep(5)
-    result["active_runtimes"] = len(listed)
+    result["active_runtimes"] = len(_after_enabling(api, project, api.list_runtimes))
     full = cfg.get("_full_drive", False)
     token = accounts.drive_token(cfg, project, cfg["drive_folder"], full_drive=full)
     drive = drive_api.DriveClient(drive_api.TokenSource(token["token"], project))
-    check_drive_identity(cfg, drive)
+    _after_enabling(api, project, lambda: check_drive_identity(cfg, drive))
     return {**result, "drive_ready": True}
 
 
@@ -197,6 +210,11 @@ def login(email, *, reauth=False, no_launch_browser=False, no_switch=False, proj
             if active:
                 raise RuntimeError("The current Google account still has active Colab runtimes. "
                                    "Save and stop them before switching accounts.")
+            pending = [s for s, r in runtimes.load(CONFIG_DIR, previous["expected_email"]).items()
+                       if s != runtimes.ABANDONED and r.get("state") == "pending"]
+            if pending:
+                raise RuntimeError("The current account has a runtime creation still pending. Run "
+                                   "`colab-persist start` (or `status`) on it first, then switch.")
 
         require_old_account_stopped()
         directory = accounts.account_dir(CONFIG_DIR, email)
@@ -257,11 +275,11 @@ def setup(project):
         services = api.enable_services(project)
         accounts.save_meta(CONFIG_DIR, cfg["expected_email"], quota_project=project)
         _TOKENS.clear()
-        tier = api.subscription()
+        tier = _after_enabling(api, project, api.subscription)
         result = {"account": cfg["expected_email"], "project_saved": True, "services": services,
                   "colab_tier": tier.replace("SUBSCRIPTION_TIER_", "").lower()}
         try:
-            check_drive_identity(cfg)
+            _after_enabling(api, project, lambda: check_drive_identity(cfg))
             result["drive_ready"] = True
         except RuntimeError as error:
             result.update(drive_ready=False, drive_error=str(error))
@@ -277,14 +295,22 @@ def managed_runtime(cfg, api):
     by_id = {colab_api.runtime_id_of(r): r for r in everything}
     ledger = runtimes.load(CONFIG_DIR, email)
     record = ledger.get(session)
+    if record and record["runtime_id"] not in by_id and record.get("state") == "ready":
+        # A listing can miss a runtime another command just created; ask for it by exact ID.
+        confirmed = api.get_runtime(record["runtime_id"])
+        if confirmed is not None:
+            by_id[record["runtime_id"]] = confirmed
+            everything = [*everything, confirmed]
     if record and record["runtime_id"] in by_id:
         runtime = by_id[record["runtime_id"]]
-        if record.get("state") == "pending" and runtime.get("connectionInfo"):
+        if not runtime.get("connectionInfo"):
+            return None, everything, record if record.get("state") == "pending" else None
+        if record.get("state") == "pending":
             runtimes.mark_ready(CONFIG_DIR, email, session, record["runtime_id"],
                                 colab_api.endpoint_from_url(runtime["connectionInfo"]["url"]))
         return runtime, everything, None
     if record and record.get("state") == "ready":
-        # Deleted elsewhere or reclaimed by Google; forget only our own ledger entry.
+        # Deleted elsewhere or reclaimed by Google (confirmed by ID); forget only our own entry.
         runtimes.forget(CONFIG_DIR, email, session, record["runtime_id"])
         record = None
     if record is None:
@@ -399,25 +425,47 @@ def remote_call(operation, *, item=None, timeout=900, **parameters):
     request = {"operation": operation, "folder": cfg["drive_folder"],
                "snapshot_limit": cfg.get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT),
                "drive": drive_token(cfg), **parameters}
+    payload = json.dumps(request).encode()
     try:
-        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=json.dumps(request).encode(),
-                      timeout=timeout).decode(errors="replace")
+        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=payload, timeout=timeout).decode(errors="replace")
     except RuntimeError as error:
-        if "No module named colab_persist" not in str(error) and "can't cd to" not in str(error) \
-                and "No such file or directory" not in str(error):
+        detail = str(error)
+        if remote.ERROR_PREFIX in detail:
+            return parse_result(detail, operation)  # Raises with the engine's own reason.
+        missing = "No module named colab_persist" in detail or (
+            ENGINE_ROOT in detail and ("can't cd" in detail or "No such file or directory" in detail))
+        if not missing:
             raise
         install_engine(item)  # A runtime adopted after an interrupted start has no engine yet.
-        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=json.dumps(request).encode(),
-                      timeout=timeout).decode(errors="replace")
+        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=payload, timeout=timeout).decode(errors="replace")
     return parse_result(raw, operation)
+
+
+@contextlib.contextmanager
+def token_refresher(item, every_seconds=1800):
+    """Keep the VM's Drive token fresh during one long remote operation."""
+    stop = threading.Event()
+
+    def refresh():
+        while not stop.wait(every_seconds):
+            try:
+                remote_call("connect", item=item, timeout=120)
+            except Exception:
+                pass  # The operation itself reports any lasting Drive problem.
+    thread = threading.Thread(target=refresh, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 def parse_result(raw, operation=None):
     results = [line[len(remote.RESULT_PREFIX):] for line in raw.splitlines()
                if line.startswith(remote.RESULT_PREFIX)]
     if not results:
-        errors = [line[len(remote.ERROR_PREFIX):] for line in raw.splitlines()
-                  if line.startswith(remote.ERROR_PREFIX)]
+        errors = [line.split(remote.ERROR_PREFIX, 1)[1] for line in raw.splitlines()
+                  if remote.ERROR_PREFIX in line]
         reason = ""
         if errors:
             with contextlib.suppress(ValueError, KeyError, TypeError):
@@ -458,11 +506,14 @@ export COLAB_DATASET_ROOT="${{COLAB_DATASET_ROOT:-gdrive://{folder}/datasets}}"
 CUDA
 python3 - <<'PY'
 from pathlib import Path
+import site
 p = Path.home() / '.bashrc'
 line = 'source /etc/profile.d/colab-cuda.sh\\n'
 old = p.read_text() if p.exists() else ''
 if line not in old:
     p.write_text(line + old)
+# Non-interactive SSH commands skip profile scripts; a .pth file still finds the helpers.
+Path(site.getsitepackages()[0], 'colab_persist_engine.pth').write_text('{ENGINE_ROOT}\\n')
 PY
 '''.encode()
     checked([*ssh_command(item), "bash -s"], data=setup)
@@ -591,13 +642,15 @@ def save_and_stop(*, stop=True):
 
 
 def _save_and_stop(item, stop):
-    receipt = remote_call("seal", item=item)
+    with token_refresher(item):
+        receipt = remote_call("seal", item=item)
     # nothing_to_save: no managed workspace, so no managed data can be lost. Unmanaged
     # files are never captured, as in every other stop.
     nothing = bool(receipt.get("nothing_to_save"))
     if not receipt.get("drive_upload_verified") and not nothing:
         raise RuntimeError("Drive did not verify every checkpoint upload. Shutdown refused.")
     if not nothing:
+        remember_pairs(config(), receipt["checkpoints"])
         # Keep a small local receipt for diagnosis; the data itself lives in Drive.
         remote.write_json(CONFIG_DIR / "last-save.json",
                           {**{k: v for k, v in receipt.items() if k != "checkpoints"},
@@ -618,6 +671,33 @@ def _save_and_stop(item, stop):
             "checkpoints": [checkpoint_summary(s) for s in receipt["checkpoints"]]}
 
 
+def _pairs_path(cfg):
+    return accounts.account_dir(CONFIG_DIR, cfg["expected_email"]) / "verified-pairs.json"
+
+
+def known_pair(cfg, project):
+    """The last checkpoint pair this computer saw verified for a project, if any."""
+    try:
+        pairs = json.loads(_pairs_path(cfg).read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    return pairs.get(cfg["drive_folder"], {}).get(project)
+
+
+def remember_pairs(cfg, checkpoints):
+    path = _pairs_path(cfg)
+    try:
+        pairs = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        pairs = {}
+    folder = pairs.setdefault(cfg["drive_folder"], {})
+    for item in checkpoints:
+        if item.get("manifest_file_id") and item.get("archive_file_id"):
+            folder[item["project"]] = {"snapshot": item["snapshot"], "manifest_file_id": item["manifest_file_id"],
+                                       "archive_file_id": item["archive_file_id"]}
+    accounts._private_write(path, pairs)
+
+
 def checkpoint_summary(item):
     return {**{k: v for k, v in item.items() if k != "files"}, "file_count": len(item["files"])}
 
@@ -634,7 +714,7 @@ def snapshots(project):
     for item in files:
         if item["name"].endswith(".tar.gz"):
             archives.setdefault(item["name"][:-7], []).append(item)
-    result = []
+    result, seen = [], set()
     for item in sorted((f for f in files if f["name"].endswith(".json")), key=lambda f: f["name"], reverse=True):
         snapshot = item["name"][:-5]
         props = item.get("appProperties") or {}
@@ -645,23 +725,29 @@ def snapshots(project):
                        "archive_sha256": props.get("cp_archive_sha256"),
                        "file_count": int(props.get("cp_file_count") or 0)}
         else:
-            manifest = json.loads(drive.read_bytes(item["id"]))
-            if manifest.get("schema") != 1 or manifest.get("snapshot") != snapshot:
-                continue
-            summary = checkpoint_summary(manifest)
-        if any(remote.archive_matches(a, summary) for a in archives.get(snapshot, [])):
+            try:
+                manifest = json.loads(drive.read_bytes(item["id"]))
+                if manifest.get("schema") != 1 or manifest.get("snapshot") != snapshot:
+                    continue
+                summary = checkpoint_summary(manifest)
+            except (ValueError, KeyError, TypeError):
+                continue  # A broken marker is not a checkpoint.
+        if snapshot not in seen and any(remote.archive_matches(a, summary) for a in archives.get(snapshot, [])):
+            seen.add(snapshot)
             result.append(summary)
     return result
 
 
 def prepare(project="default"):
     with operation_lock():
-        return remote_call("prepare", project=remote.valid_name(project))
+        project = remote.valid_name(project)
+        return remote_call("prepare", project=project, known=known_pair(config(), project))
 
 
 def restore(project, snapshot="latest"):
     with operation_lock():
-        return remote_call("restore", project=remote.valid_name(project), snapshot=snapshot)
+        project = remote.valid_name(project)
+        return remote_call("restore", project=project, snapshot=snapshot, known=known_pair(config(), project))
 
 
 def dataset_plan(manifest_path, cache_gib=40, reserve_gib=20):
@@ -726,7 +812,7 @@ def upload_source(item, project, script_path, source_directory=None):
         archive = Path(temporary) / "source.tar.gz"
         with tarfile.open(archive, "w:gz") as target:
             for name in files:
-                target.add(source / name, arcname=name, recursive=False)
+                remote.add_regular(target, source / name, name)
         with archive.open("rb") as stream:
             result = subprocess.run([*ssh_command(item), "cat > " + incoming], stdin=stream,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
@@ -745,7 +831,7 @@ def run_script(script_path, project="default", arguments=None, source_directory=
     validate_run_inputs(script_path, project, source_directory, checkpoint_seconds)
     with operation_lock():
         item = require_runtime()
-        prepared = remote_call("prepare", item=item, project=project)
+        prepared = remote_call("prepare", item=item, project=project, known=known_pair(config(), project))
         entry = upload_source(item, project, script_path, source_directory)
         job = remote_call("launch", item=item, project=project, script=entry, arguments=arguments or [],
                           interval=checkpoint_seconds, stop_after=stop_after)
@@ -754,7 +840,7 @@ def run_script(script_path, project="default", arguments=None, source_directory=
     if detach:
         return {"detached": True, "project": project, "run_id": job.get("run_id"), "state": job.get("state"),
                 "restored": prepared["restored"], "next": f"colab-persist attach --project {project}"}
-    result = monitor(project, item=item, log=log)
+    result = monitor(project, item=item, log=log, run_id=job.get("run_id"))
     return {**result, "restored": prepared["restored"]}
 
 
@@ -770,38 +856,51 @@ def attach(project="default", stop_after=None, log=None):
     if current.get("state") == "none":
         raise RuntimeError(f"No managed job has run in project {project} on this runtime.")
     return monitor(project, item=item, stop_after=stop_after, log=log, offset=current.get("offset", 0),
-                   first=current)
+                   first=current, run_id=current.get("run_id"))
 
 
-def monitor(project, *, item, stop_after=None, log=None, offset=0, first=None):
-    """Follow a detached job without holding the local lock; finalize when it ends."""
+def monitor(project, *, item, stop_after=None, log=None, offset=0, first=None, run_id=None):
+    """Follow one detached job (pinned by run ID) without holding the local lock; finalize when it ends."""
     log = log or sys.stderr
-    tail, failures, current = "", 0, first
+    tail, failures, current, announced = "", 0, first, None
     while True:
         if current is None:
             try:
                 current = remote_call("job_status", item=item, project=project, offset=offset, timeout=120)
                 failures = 0
-            except RuntimeError as error:
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
                 failures += 1
                 if failures >= 30:
                     raise RuntimeError("Lost contact with the runtime while following the job. It may still be "
                                        f"running; reconnect with `colab-persist attach --project {project}`. "
                                        + str(error)) from None
-                if runtime_info() is None:
+                try:
+                    present = runtime_info()
+                except Exception:
+                    present = item  # This computer may be offline; keep retrying.
+                if present is None or colab_api.runtime_id_of(present) != colab_api.runtime_id_of(item):
                     raise RuntimeError("The runtime disappeared during the job. Start a new one and restore the "
                                        "last verified checkpoint.") from None
                 time.sleep(min(60, 5 * failures))
                 continue
+        if run_id is None:
+            run_id = current.get("run_id")
+        if current.get("state") != "none" and current.get("run_id") != run_id:
+            raise RuntimeError(f"A different job replaced the one being followed in project {project}; "
+                               "not acting on it. Check `colab-persist job --project " + project + "`.")
         if current.get("log"):
             log.write(current["log"])
             log.flush()
             tail = (tail + current["log"])[-8000:]
         offset = current.get("offset", offset)
         state = current.get("state")
-        if state in TERMINAL_JOB_STATES:
+        if state == "awaiting_drive" and announced != current.get("error"):
+            announced = current.get("error")
+            log.write(f"[colab-persist] Waiting to save to Drive: {announced}\n")
+            log.flush()
+        more = offset < current.get("log_bytes", 0)
+        if state in TERMINAL_JOB_STATES and not more:
             break
-        more = len(current.get("log", "")) >= remote.LOG_CHUNK_BYTES
         current = None
         if not more:
             time.sleep(POLL_SECONDS)
@@ -817,6 +916,10 @@ def monitor(project, *, item, stop_after=None, log=None, offset=0, first=None):
                            "`colab-persist stop`.")
     stop = current.get("stop_after", True) if stop_after is None else stop_after
     with waiting_lock():
+        final = remote_call("job_status", item=item, project=project, tail=0, timeout=120)
+        if final.get("run_id") != run_id or final.get("state") != "finished":
+            raise RuntimeError(f"Project {project} changed before the final save (another job started); "
+                               "nothing was stopped.")
         saved = _save_and_stop(item, stop)
     checkpoint = dict(current.get("checkpoint") or {})
     checkpoint["durability"] = remote.DURABLE
@@ -863,6 +966,14 @@ def import_legacy(projects=None, all_snapshots=False, legacy_folder=None):
         item = require_runtime()
         if not remote_call("status", item=item).get("drive_mounted"):
             legacy_mount(cfg, item)
-        return remote_call("import_legacy", item=item, timeout=6 * 3600,
-                           legacy_folder=legacy_folder or cfg["legacy_drive_folder"],
-                           projects=list(projects) if projects else None, all_snapshots=bool(all_snapshots))
+        _TOKENS.clear()  # Start the long transfer with a full-lifetime token.
+        with token_refresher(item):
+            report = remote_call("import_legacy", item=item, timeout=6 * 3600,
+                                 legacy_folder=legacy_folder or cfg["legacy_drive_folder"],
+                                 projects=list(projects) if projects else None, all_snapshots=bool(all_snapshots))
+        newest = {}
+        for entry in report.get("imported", []) + report.get("skipped", []):
+            if entry.get("manifest_file_id") and entry["snapshot"] >= newest.get(entry["project"], {}).get("snapshot", ""):
+                newest[entry["project"]] = entry
+        remember_pairs(cfg, list(newest.values()))
+        return report

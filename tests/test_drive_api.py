@@ -161,23 +161,35 @@ class MetadataTests(ClientCase):
         self.assertIsNone(drive.resolve(["Colab-Persist", "projects"]))
         self.assertEqual(len(self.opener.requests), 1)
         drive = self.client((200, {}, json_body({"files": []})),
+                            (200, {}, json_body({"ids": ["created-1"]})),
                             (200, {}, json_body({"id": "created-1"})),
                             (200, {}, json_body({"files": [{"id": "existing-2"}]})))
         self.assertEqual(drive.resolve(["Colab-Persist", "projects"], create=True), "existing-2")
-        post = self.opener.requests[1]
+        self.assertIn("/files/generateIds", self.opener.requests[1].url)
+        post = self.opener.requests[2]
         self.assertEqual(post.method, "POST")
-        self.assertEqual(json.loads(post.body), {"name": "Colab-Persist", "mimeType": drive_api.FOLDER_MIME,
-                                                 "parents": ["root"]})
-        self.assertIn("'created-1' in parents", query(self.opener.requests[2].url)["q"])
+        # The pre-generated ID makes a retried create land on the same folder.
+        self.assertEqual(json.loads(post.body), {"id": "created-1", "name": "Colab-Persist",
+                                                 "mimeType": drive_api.FOLDER_MIME, "parents": ["root"]})
+        self.assertIn("'created-1' in parents", query(self.opener.requests[3].url)["q"])
+
+    def test_a_create_that_already_happened_is_not_repeated(self):
+        drive = self.client((200, {}, json_body({"files": []})),
+                            (200, {}, json_body({"ids": ["created-1"]})),
+                            (409, {}, drive_error_body(409, "alreadyExists")),
+                            (200, {}, json_body({"id": "created-1", "name": "Colab-Persist",
+                                                 "mimeType": drive_api.FOLDER_MIME, "trashed": False})))
+        self.assertEqual(drive.ensure_folder("root", "Colab-Persist"), "created-1")
 
 
 class UploadBytesTests(ClientCase):
     def test_multipart_upload_is_verified(self):
         data = b'{"schema": 1}\n'
-        drive = self.client((200, {}, json_body(metadata(data, "x.json"))))
+        drive = self.client((200, {}, json_body({"ids": ["file-1"]})), (200, {}, json_body(metadata(data, "x.json"))))
         result = drive.upload_bytes(data, "folder-1", "x.json", app_properties={"cp_kind": "manifest"})
         self.assertEqual(result["id"], "file-1")
-        sent = self.opener.requests[0]
+        sent = self.opener.requests[1]
+        self.assertIn(b'"id": "file-1"', sent.body)
         self.assertEqual(query(sent.url)["uploadType"], "multipart")
         self.assertTrue(sent.headers["content-type"].startswith("multipart/related; boundary="))
         self.assertIn(b'"parents": ["folder-1"]', sent.body)
@@ -186,7 +198,8 @@ class UploadBytesTests(ClientCase):
 
     def test_checksum_mismatch_is_an_error(self):
         data = b"payload"
-        drive = self.client((200, {}, json_body(metadata(b"other!!", "x.json"))))
+        drive = self.client((200, {}, json_body({"ids": ["file-1"]})),
+                            (200, {}, json_body(metadata(b"other!!", "x.json"))))
         with self.assertRaisesRegex(drive_api.DriveError, "SHA-256 mismatch"):
             drive.upload_bytes(data, "folder-1", "x.json")
 
@@ -335,7 +348,11 @@ class DownloadTests(ClientCase):
             drive.download("id-1", self.target, expected_size=10, expected_sha256="0" * 64)
 
     def test_short_and_long_downloads(self):
-        drive = self.client(FakeResponse(200, body=self.data[:3]))
+        drive = self.client(FakeResponse(200, body=self.data[:3]), FakeResponse(206, body=self.data[3:]))
+        self.assertEqual(drive.download("id-1", self.target, expected_size=10, expected_sha256=self.sha), self.sha)
+        self.assertEqual(self.opener.requests[1].headers.get("range"), "bytes=3-")
+        drive = self.client(*[FakeResponse(206 if i else 200, body=self.data[:3] if i == 0 else b"")
+                              for i in range(drive.retries + 1)])
         with self.assertRaisesRegex(drive_api.DriveError, "Downloaded 3 bytes, expected 10"):
             drive.download("id-1", self.target, expected_size=10)
         drive = self.client(FakeResponse(200, body=self.data + b"extra"))

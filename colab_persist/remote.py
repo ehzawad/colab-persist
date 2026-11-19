@@ -67,7 +67,7 @@ def digest(path: Path) -> str:
 
 
 def write_json(path: Path, value: dict) -> None:
-    temporary = path.with_name(path.name + ".partial")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.partial")
     with temporary.open("w") as target:
         json.dump(value, target, indent=2, sort_keys=True)
         target.write("\n")
@@ -137,13 +137,48 @@ def summary_properties(manifest: dict) -> dict:
             "cp_archive_sha256": manifest.get("archive_sha256", "")}
 
 
-def archive_matches(meta: dict | None, manifest: dict) -> bool:
-    if not meta:
+def archive_matches(meta: dict | None, manifest: dict, strict: bool = False) -> bool:
+    """Size and Drive's SHA-256 match. Without strict, a missing SHA-256 is left to the
+    full byte check that restore performs; strict (used before trusting a pair for
+    shutdown) requires Drive's own SHA-256."""
+    if not meta or meta.get("trashed"):
         return False
     if int(meta.get("size", -1)) != manifest.get("archive_bytes"):
         return False
     stored = meta.get("sha256Checksum")
-    return stored is None or stored == manifest["archive_sha256"]
+    if stored is None:
+        return not strict
+    return stored == manifest["archive_sha256"]
+
+
+def add_regular(archive: tarfile.TarFile, path: Path, name: str) -> None:
+    """Archive a file as a regular member; hard links would be rejected on restore."""
+    info = archive.gettarinfo(str(path), arcname=name)
+    if not info.isreg():
+        info.type, info.linkname = tarfile.REGTYPE, ""
+        info.size = path.stat().st_size
+    with path.open("rb") as stream:
+        archive.addfile(info, stream)
+
+
+def has_files(root: Path) -> bool:
+    """True when anything other than empty directories exists below root."""
+    if not root.exists():
+        return False
+    for _, names, files in os.walk(root, followlinks=False):
+        if files or any(Path(_, n).is_symlink() for n in names):
+            return True
+    return False
+
+
+def remove_empty_tree(root: Path) -> None:
+    """Remove a directory that holds only empty directories; never a file."""
+    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+        if files:
+            raise RuntimeError("Restore requires an empty workspace; existing work is never overwritten.")
+        for name in names:
+            os.rmdir(Path(directory, name))
+    os.rmdir(root)
 
 
 class Store:
@@ -172,10 +207,44 @@ class Store:
 
     def project_folder(self, project, create=False):
         parts = [self.folder, "projects", valid_name(project)]
+        self.require_drive()
         if not create:
-            return self.require_drive().resolve(parts)
+            return self._resolve(parts, create=False)
         with self._folder_lock():
-            return self.require_drive().resolve(parts, create=True)
+            return self._resolve(parts, create=True)
+
+    def _folder_cache_path(self):
+        return self.scratch / ".drive-folders.json"
+
+    def _resolve(self, parts, create):
+        """Resolve a folder path, remembering created IDs so listing lag cannot cause duplicates."""
+        path = self._folder_cache_path()
+        try:
+            cache = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            cache = {}
+        parent, key, changed = "root", "", False
+        for part in parts:
+            key += "/" + part
+            folder = cache.get(key)
+            if folder:
+                meta = self.drive.get(folder)
+                if not (meta and not meta.get("trashed") and meta.get("name") == part
+                        and meta.get("mimeType") == drive_api.FOLDER_MIME):
+                    folder = None
+            if not folder:
+                folder = self.drive.find_folder(parent, part)
+            if not folder:
+                if not create:
+                    return None
+                folder = self.drive.ensure_folder(parent, part)
+            if cache.get(key) != folder:
+                cache[key], changed = folder, True
+            parent = folder
+        if changed:
+            self.scratch.mkdir(parents=True, exist_ok=True)
+            write_json(path, cache)
+        return parent
 
     @contextlib.contextmanager
     def _folder_lock(self):
@@ -211,20 +280,28 @@ class Store:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     # -- checkpoint listing ----------------------------------------------------------
-    def entries(self, project):
-        """Manifest/archive candidates, newest first. Orphan archives are ignored."""
+    def entries(self, project, known=None):
+        """Manifest/archive candidates, newest first. Orphan archives are ignored.
+
+        ``known`` is the last verified pair this computer recorded, so a replacement VM
+        finds it even while Drive's listing still lags behind the write."""
         folder = self.project_folder(project)
         files = self.drive.children(folder, folders=False) if folder else []
+        pairs = []
         last = self._last_upload_path(project)
         if last.exists():
+            pairs.append(json.loads(last.read_text()))
+        if known:
+            pairs.append({"manifest_id": known.get("manifest_file_id"), "archive_id": known.get("archive_file_id")})
+        ids = {item["id"] for item in files}
+        for pair in pairs:
             # Listings can lag behind a write; a known ID is fetched directly.
-            known = json.loads(last.read_text())
-            ids = {item["id"] for item in files}
             for key in ("manifest_id", "archive_id"):
-                if known.get(key) and known[key] not in ids:
-                    item = self.drive.get(known[key])
-                    if item and not item.get("trashed"):
+                if pair.get(key) and pair[key] not in ids:
+                    item = self.drive.get(pair[key])
+                    if item and not item.get("trashed") and (folder is None or folder in item.get("parents", [folder])):
                         files.append(item)
+                        ids.add(item["id"])
         grouped = {}
         for item in files:
             name = item["name"]
@@ -255,6 +332,8 @@ class Store:
         manifest = json.loads(raw)
         if manifest.get("schema") != 1 or manifest.get("snapshot") != entry["snapshot"]:
             raise RuntimeError(f"Checkpoint manifest {entry['snapshot']} is not a valid schema-1 manifest.")
+        self._validated_md5 = getattr(self, "_validated_md5", {})
+        self._validated_md5[meta["id"]] = hashlib.md5(raw).hexdigest()
         return manifest
 
     def archive_for(self, entry, manifest):
@@ -272,9 +351,9 @@ class Store:
                 result.append(manifest)
         return result
 
-    def latest(self, project):
+    def latest(self, project, known=None):
         """Newest committed checkpoint, refusing to skip silently past a broken one."""
-        entries = self.entries(project)
+        entries = self.entries(project, known)
         if not entries:
             return None
         entry = entries[0]
@@ -299,10 +378,16 @@ class Store:
         except (RuntimeError, ValueError):
             previous = None  # A broken newest pair is never reused; a fresh checkpoint supersedes it.
         if previous and previous["manifest"]["files"] == files:
-            fresh = self.drive.get(previous["archive"]["id"])
-            if fresh and not fresh.get("trashed") and archive_matches(fresh, previous["manifest"]):
+            # Reuse only a pair that is verifiably intact right now: both files fetched by ID.
+            archive_now = self.drive.get(previous["archive"]["id"])
+            manifest_id = previous["entry"]["manifest"]["id"]
+            manifest_now = self.drive.get(manifest_id)
+            validated = getattr(self, "_validated_md5", {}).get(manifest_id)
+            if (archive_matches(archive_now, previous["manifest"], strict=True) and manifest_now
+                    and not manifest_now.get("trashed") and validated
+                    and manifest_now.get("md5Checksum") == validated):
                 return {**previous["manifest"], "reused": True, "durability": DURABLE,
-                        "manifest_file_id": previous["entry"]["manifest"]["id"], "archive_file_id": fresh["id"]}
+                        "manifest_file_id": manifest_id, "archive_file_id": archive_now["id"]}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         identifier = stamp + "-" + uuid.uuid4().hex[:8]
         # gzip can grow incompressible input; allow headers plus a free-disk reserve.
@@ -313,10 +398,12 @@ class Store:
             archive = Path(temporary) / (identifier + ".tar.gz")
             with tarfile.open(archive, "w:gz", compresslevel=1) as target:
                 for name in files:
-                    target.add(workspace / name, arcname=name, recursive=False)
+                    add_regular(target, workspace / name, name)
             # Validate what was actually archived; a live writer cannot silently produce a good manifest.
             with tarfile.open(archive, "r:gz") as source:
                 for member in source.getmembers():
+                    if not member.isfile() or member.name not in files:
+                        raise RuntimeError(f"Unexpected archive member {member.name}; refusing to publish.")
                     h = hashlib.sha256()
                     with source.extractfile(member) as stream:
                         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
@@ -344,18 +431,18 @@ class Store:
                 "manifest_file_id": manifest_meta["id"], "archive_file_id": archive_meta["id"]}
 
     # -- restore -------------------------------------------------------------------
-    def restore(self, project, snapshot="latest"):
+    def restore(self, project, snapshot="latest", known=None):
         self.require_drive()
         workspace = self.workspace(project)
-        if workspace.exists() and any(workspace.iterdir()):
+        if has_files(workspace):
             raise RuntimeError("Restore requires an empty workspace; existing work is never overwritten.")
         if snapshot == "latest":
-            chosen = self.latest(project)
+            chosen = self.latest(project, known)
             if chosen is None:
                 raise RuntimeError("No completed snapshot found.")
             manifest, archive_meta = chosen["manifest"], chosen["archive"]
         else:
-            entry = next((e for e in self.entries(project) if e["snapshot"] == snapshot), None)
+            entry = next((e for e in self.entries(project, known) if e["snapshot"] == snapshot), None)
             if entry is None:
                 raise RuntimeError("No completed snapshot found.")
             manifest = self.load_manifest(entry)
@@ -377,27 +464,34 @@ class Store:
             staging.mkdir()
             extract_archive(archive, staging, self.snapshot_limit)
             # The safe "data" extraction filter normalizes permissions; reapply the recorded ones.
+            root = staging.resolve()
             for name, info in manifest["files"].items():
+                relative = PurePosixPath(name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("Unsafe path in checkpoint manifest.")
                 target = staging / name
-                if target.is_file() and not target.is_symlink():
+                if target.is_symlink() or not target.resolve().is_relative_to(root):
+                    raise ValueError("Unsafe path in checkpoint manifest.")
+                if target.is_file():
                     os.chmod(target, info.get("mode", 0o644) & 0o777)
             if inventory(staging, self.snapshot_limit) != manifest["files"]:
                 raise RuntimeError("Restored files do not match the checkpoint manifest.")
             if workspace.exists():
-                workspace.rmdir()  # Empty only; never removes user files.
+                remove_empty_tree(workspace)  # Empty directories only; never removes user files.
             staging.rename(workspace)
         return {"project": project, "snapshot": manifest["snapshot"],
                 "restored_files": len(manifest["files"]), "workspace": str(workspace),
                 "archive_sha256": manifest["archive_sha256"]}
 
-    def prepare(self, project):
+    def prepare(self, project, known=None):
         with self.project_lock(project):
             workspace = self.workspace(project)
             restored = None
-            if not workspace.exists() or not any(workspace.iterdir()):
+            # A workspace holding only empty directories (such as a fresh outputs/) still restores.
+            if not has_files(workspace):
                 self.require_drive()
-                if self.entries(project):
-                    restored = self.restore(project)
+                if self.entries(project, known):
+                    restored = self.restore(project, known=known)
                 else:
                     workspace.mkdir(parents=True, exist_ok=True)
             (workspace / "outputs").mkdir(exist_ok=True)
@@ -437,9 +531,12 @@ class Store:
         With no managed workspace there is nothing to save, so the receipt says so
         instead of refusing the shutdown."""
         projects = list(self.status()["workspaces"])
+        skipped = [p for p in projects if not has_files(self.workspace(p))]
+        projects = [p for p in projects if p not in skipped]
         if not projects:
+            # Empty workspaces hold nothing to save, and must never supersede a real checkpoint.
             return {"drive_upload_verified": False, "drive_flushed": False, "nothing_to_save": True,
-                    "checkpoints": [], "checked_at": now()}
+                    "checkpoints": [], "skipped_empty": skipped, "checked_at": now()}
         with contextlib.ExitStack() as stack:
             for project in projects:
                 stack.enter_context(self.project_lock(project))
@@ -451,7 +548,7 @@ class Store:
             stamp = now()
             # drive_flushed is kept for v0.3 callers: it means the data is durably in Drive.
             receipt = {"drive_upload_verified": True, "drive_flushed": True, "checkpoints": checkpoints,
-                       "verified_at": stamp, "flushed_at": stamp}
+                       "skipped_empty": skipped, "verified_at": stamp, "flushed_at": stamp}
             self.scratch.mkdir(parents=True, exist_ok=True)
             write_json(self.scratch / "flush-receipt.json", receipt)
             return receipt
@@ -467,8 +564,8 @@ class Store:
         except (FileNotFoundError, ValueError):
             return None
 
-    def _write_job(self, project, **values):
-        state = {**(self._read_job(project) or {}), **values, "updated_at": now()}
+    def _write_job(self, project, *, fresh=False, **values):
+        state = {**({} if fresh else (self._read_job(project) or {})), **values, "updated_at": now()}
         write_json(self._job_dir(project) / "job.json", state)
         return state
 
@@ -497,37 +594,65 @@ class Store:
                                             "arguments": arguments, "interval": interval,
                                             "stop_after": bool(stop_after), "folder": self.folder,
                                             "snapshot_limit": self.snapshot_limit, "scratch": str(self.scratch)})
-        self._write_job(project, run_id=run_id, state="starting", script=script, arguments=arguments,
+        self._write_job(project, fresh=True, run_id=run_id, state="starting", script=script, arguments=arguments,
                         stop_after=bool(stop_after), exit_code=None, error=None)
         root = Path(__file__).resolve().parent.parent
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), env.get("PYTHONPATH")]))
-        with (base / "worker.log").open("ab") as log:
-            subprocess.Popen([sys.executable, "-m", "colab_persist.remote", "--worker", project,
-                              "--scratch", str(self.scratch)],
-                             cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                             start_new_session=True, close_fds=True)
+        try:
+            with (base / "worker.log").open("ab") as log:
+                worker = subprocess.Popen([sys.executable, "-m", "colab_persist.remote", "--worker", project,
+                                           "--scratch", str(self.scratch)],
+                                          cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                          start_new_session=True, close_fds=True)
+        except OSError as error:
+            self._write_job(project, state="refused", error=f"Could not start the job worker: {error}")
+            raise
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             job = self._read_job(project) or {}
             if job.get("run_id") == run_id and job.get("state") != "starting":
                 return job
+            if getattr(worker, "poll", lambda: None)() is not None:
+                job = self._read_job(project) or {}
+                if job.get("run_id") == run_id and job.get("state") == "starting":
+                    return self._write_job(project, state="lost", error="The job worker exited during startup "
+                                           f"(code {worker.returncode}); see worker.log on the VM.")
+                return job
             time.sleep(0.5)
+        self._write_job(project, state="lost", error="The job worker did not start; see worker.log on the VM.")
         raise RuntimeError("The job worker did not start; see worker.log in the project directory on the VM.")
 
     def job_status(self, project, offset=0, tail=None):
         job = self._read_job(project)
         if not job:
             return {"state": "none", "project": project}
-        if job.get("state") in ("running", "saving", "awaiting_drive") and job.get("pid"):
+        if job.get("state") == "starting":
+            try:
+                started = datetime.fromisoformat(job.get("updated_at", ""))
+                if (datetime.now(timezone.utc) - started).total_seconds() > 60:
+                    job = {**job, "state": "lost", "error": "The job worker never started; see worker.log on the VM."}
+            except ValueError:
+                pass
+        elif job.get("state") in ("running", "saving", "awaiting_drive") and job.get("pid"):
+            alive = True
             try:
                 os.kill(int(job["pid"]), 0)
             except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                pass
+            if alive:
+                # A zombie or a reused PID still answers kill(0); the live worker always holds the lock.
+                try:
+                    with self.project_lock(project):
+                        alive = False
+                except RuntimeError:
+                    pass
+            if not alive:
                 job = {**job, "state": "lost",
                        "error": "The job worker stopped unexpectedly. The workspace is still on the VM; "
                                 "run `colab-persist save` or `colab-persist stop` to keep it."}
-            except PermissionError:
-                pass
         log = self.workspace(project) / "outputs" / "run.log"
         chunk, size = "", 0
         if log.exists():
@@ -548,7 +673,9 @@ class Store:
             lock = self.project_lock(project)
             lock.__enter__()
         except RuntimeError as error:
-            self._write_job(project, state="refused", error=str(error))
+            current = self._read_job(project) or {}
+            if current.get("run_id") == spec.get("run_id") and current.get("state") == "starting":
+                self._write_job(project, state="refused", error=str(error))  # Never touch another run's state.
             return
         try:
             self._work(project, spec)
@@ -618,7 +745,17 @@ class Store:
             except (drive_api.QuotaExceeded, ValueError) as error:
                 self._write_job(project, state="exited_unsaved", error=str(error)[:500])
                 return
-            except (drive_api.DriveError, OSError) as error:
+            except drive_api.DriveError as error:
+                transient = (isinstance(error, drive_api.TokenExpired) or error.status is None
+                             or error.status in drive_api.RETRY_STATUS
+                             or (error.status == 403 and error.reason in drive_api.RATE_REASONS))
+                if not transient or time.monotonic() > deadline:
+                    self._write_job(project, state="exited_unsaved", error=str(error)[:500])
+                    return
+                self._write_job(project, state="awaiting_drive", error=str(error)[:500])
+                time.sleep(DRIVE_RETRY_SECONDS)
+                continue
+            except OSError as error:
                 # Token expiry or network loss: keep the job's results and wait for a reconnect.
                 if time.monotonic() > deadline:
                     self._write_job(project, state="exited_unsaved", error=str(error)[:500])
@@ -642,12 +779,18 @@ class Store:
                                "Run `colab-persist import-legacy` from an interactive terminal.")
         self.require_drive()
         names = sorted(p.name for p in root.iterdir() if p.is_dir())
+        report_invalid = []
+        if not projects:
+            report_invalid = [n for n in names if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", n)]
+            names = [n for n in names if n not in report_invalid]
         if projects:
             missing = sorted(set(projects) - set(names))
             if missing:
                 raise RuntimeError(f"Legacy projects not found: {', '.join(missing)}")
             names = [n for n in names if n in projects]
         report = {"imported": [], "skipped": [], "legacy_root": f"My Drive/{legacy_folder}/projects"}
+        if not projects and report_invalid:
+            report["ignored_folders"] = report_invalid
         for project in names:
             valid_name(project)
             manifests = []
@@ -668,7 +811,22 @@ class Store:
             for manifest, raw, archive in manifests:
                 entry = existing.get(manifest["snapshot"])
                 if entry and self.archive_for(entry, manifest):
-                    report["skipped"].append({"project": project, "snapshot": manifest["snapshot"]})
+                    try:
+                        destination_ok = self.load_manifest(entry) == manifest
+                    except (RuntimeError, ValueError):
+                        destination_ok = False
+                    if destination_ok:
+                        report["skipped"].append({"project": project, "snapshot": manifest["snapshot"],
+                                                  "manifest_file_id": entry["manifest"]["id"],
+                                                  "archive_file_id": self.archive_for(entry, manifest)["id"]})
+                        continue
+                    # The archive is intact but its commit marker is not: replace only the marker.
+                    for broken in entry["manifests"]:
+                        self.drive.trash(broken["id"])
+                    repaired = self.drive.upload_bytes(raw, folder, manifest["snapshot"] + ".json",
+                                                       app_properties=summary_properties(manifest))
+                    report.setdefault("repaired", []).append({"project": project, "snapshot": manifest["snapshot"],
+                                                              "manifest_file_id": repaired["id"]})
                     continue
                 # upload_file hashes the legacy archive first and refuses a mismatch.
                 archive_meta = self.drive.upload_file(
@@ -677,6 +835,12 @@ class Store:
                                     "cp_sha256": manifest["archive_sha256"]})
                 manifest_meta = self.drive.upload_bytes(raw, folder, manifest["snapshot"] + ".json",
                                                         app_properties=summary_properties(manifest))
+                if manifest is manifests[0][0]:
+                    # Listings can lag right after the import; remember the newest pair by ID.
+                    self._last_upload_path(project).parent.mkdir(parents=True, exist_ok=True)
+                    write_json(self._last_upload_path(project), {"snapshot": manifest["snapshot"],
+                                                                  "manifest_id": manifest_meta["id"],
+                                                                  "archive_id": archive_meta["id"]})
                 report["imported"].append({"project": project, "snapshot": manifest["snapshot"],
                                            "archive_bytes": manifest["archive_bytes"],
                                            "files": len(manifest["files"]),

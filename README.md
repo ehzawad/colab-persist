@@ -140,8 +140,9 @@ Colab Persist talks to Drive through the Drive API, not a Drive mount on the VM.
   Drive reports the stored size and SHA-256, and colab-persist compares them with the
   local archive before writing the JSON manifest, which is the commit marker.
   An interrupted upload leaves no file; an archive without a manifest is ignored.
-- **Same account, always.** Drive is checked against the selected Colab account on
-  your computer and again from the VM; a mismatch stops before anything is written.
+- **Same account, always.** Every Drive token is checked against the selected Colab
+  account on your computer before it is used or sent to the VM; a mismatch stops
+  before anything is written.
 
 Checkpoints live in `My Drive/Colab-Persist/projects/<project>/` as
 `<id>.tar.gz` plus `<id>.json`, the same format as earlier versions. Because
@@ -154,7 +155,8 @@ client in your Cloud project and sign in with
 `colab-persist login --email YOUR_GOOGLE_EMAIL --project YOUR_PROJECT_ID --client-id-file client_secret.json`.
 That requests full Drive access through your own client. Google shows an
 "unverified app" warning on that consent screen, and refresh tokens from apps left
-in Testing mode expire after seven days.
+in Testing mode expire after seven days. Repeat `--client-id-file` whenever you
+select that account again; without it, `login` signs in again with `drive.file`.
 
 ## Accounts
 
@@ -401,7 +403,9 @@ The `drive.file` permission cannot see those files, so 0.4 keeps its checkpoints
 `My Drive/Colab-Persist/` and `import-legacy` copies the newest checkpoint of each
 old project across (`--all-snapshots` for every one, `--project NAME` to pick).
 It mounts Drive the old way one last time: Colab shows its familiar Drive consent
-in the browser once, and the import continues by itself after you approve. Every
+in the browser once, and the import continues by itself after you approve. Any
+running VM works; a workspace that holds only empty folders still restores the
+imported checkpoint, and an empty workspace never replaces it. Every
 archive is checked against its recorded SHA-256 before it is published. Nothing in
 `Colab-CUDA/` is modified or deleted. Your configuration is migrated automatically,
 and the old folder name is kept as `legacy_drive_folder`.

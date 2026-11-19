@@ -118,6 +118,20 @@ class RemoteCallTests(BackendFixture, unittest.TestCase):
     def setUp(self):
         self.use_backend(snapshot_limit_bytes=1234)
         self.runtime = self.managed()
+        self.identity = self.start_patch(patch.object(backend, "check_drive_identity"))
+
+    def test_each_minted_token_is_bound_to_the_selected_account(self):
+        token = {"token": "t", "quota_project": "q", "expires_at": 4102444800, "folder": "Colab-Persist"}
+        with patch.object(backend.accounts, "drive_token", return_value=token):
+            backend.drive_token(backend.config())
+            backend.drive_token(backend.config())
+        self.identity.assert_called_once()
+        self.identity.side_effect = RuntimeError("Drive account mismatch")
+        backend._TOKENS.clear()
+        with patch.object(backend.accounts, "drive_token", return_value=token):
+            with self.assertRaisesRegex(RuntimeError, "mismatch"):
+                backend.drive_token(backend.config())
+        self.assertEqual(backend._TOKENS, {})
 
     def test_request_carries_only_a_short_lived_drive_token(self):
         token = {"token": "fake-access-token", "quota_project": fakes.QUOTA_PROJECT, "expires_at": 4102444800,

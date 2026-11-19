@@ -77,7 +77,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(path.parent, accounts.account_dir(self.config, EMAIL))
         self.assertNotIn("example.com", str(path))
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["runtimes.json"])
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["runtimes.json", "runtimes.lock"])
         self.assertEqual(list(json.loads(path.read_text())), ["cuda"])
         self.assertEqual(runtimes.load(self.config, "second@example.com"), {})
         self.assertEqual(runtimes.ledger_path(self.config, "FIRST@example.com"), path)

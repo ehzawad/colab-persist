@@ -175,12 +175,22 @@ class WorkerTests(JobCase):
         (self.workspace / "job.py").write_text("print('never runs')\n")
         remote.write_json(self.store._job_dir("demo") / "job-spec.json",
                           {"run_id": "run-2", "script": "job.py", "arguments": [], "interval": 60})
+        self.store._write_job("demo", fresh=True, run_id="run-2", state="starting")
         with self.store.project_lock("demo"):
             self.store.worker("demo")
         job = self.store._read_job("demo")
         self.assertEqual(job["state"], "refused")
         self.assertIn("active managed job", job["error"])
         self.assertFalse((self.workspace / "outputs" / "run.log").exists())
+
+    def test_a_refused_worker_never_overwrites_the_running_jobs_state(self):
+        remote.write_json(self.store._job_dir("demo") / "job-spec.json",
+                          {"run_id": "run-2", "script": "job.py", "arguments": [], "interval": 60})
+        self.store._write_job("demo", fresh=True, run_id="run-1", state="running")
+        with self.store.project_lock("demo"):
+            self.store.worker("demo")
+        job = self.store._read_job("demo")
+        self.assertEqual((job["run_id"], job["state"]), ("run-1", "running"))
 
 
 class JobStatusTests(JobCase):
@@ -214,6 +224,18 @@ class JobStatusTests(JobCase):
         self.assertEqual((first["log"], first["offset"]), ("abcd", 4))
         self.assertEqual((second["log"], second["offset"]), ("efgh", 8))
         self.assertEqual(tail["log"], "ghij")
+
+    def test_a_handshake_that_never_completed_is_lost(self):
+        self.store._write_job("demo", state="starting")
+        state = json.loads((self.store._job_dir("demo") / "job.json").read_text())
+        state["updated_at"] = "2020-01-01T00:00:00+00:00"
+        (self.store._job_dir("demo") / "job.json").write_text(json.dumps(state))
+        self.assertEqual(self.store.job_status("demo")["state"], "lost")
+
+    def test_a_dead_worker_is_lost(self):
+        self.store._write_job("demo", state="running", pid=2 ** 22 + 12345)
+        with patch.object(remote.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.store.job_status("demo")["state"], "lost")
 
     def test_job_without_a_log_yet(self):
         self.store._write_job("demo", state="starting")
@@ -273,6 +295,12 @@ class LaunchTests(JobCase):
             popen.assert_not_called()
         self.assertFalse((self.store._job_dir("demo") / "job-spec.json").exists())
 
+    def test_a_worker_that_cannot_start_leaves_a_terminal_state(self):
+        with patch.object(remote.subprocess, "Popen", side_effect=OSError("no python")):
+            with self.assertRaises(OSError):
+                self.store.launch("demo", "train.py", [], interval=10)
+        self.assertEqual(self.store.job_status("demo")["state"], "refused")
+
     def test_launch_refuses_while_a_job_holds_the_project(self):
         with patch.object(remote.subprocess, "Popen") as popen, self.store.project_lock("demo"):
             with self.assertRaisesRegex(RuntimeError, "active managed job"):
@@ -290,10 +318,19 @@ class LaunchTests(JobCase):
         clock = iter(range(0, 1000, 20))
         fake_time = MagicMock()
         fake_time.monotonic.side_effect = lambda: next(clock)
-        with patch.object(remote.subprocess, "Popen"), patch.object(remote, "time", fake_time):
+        with patch.object(remote.subprocess, "Popen") as popen, patch.object(remote, "time", fake_time):
+            popen.return_value.poll.return_value = None  # Alive, but never reports.
             with self.assertRaisesRegex(RuntimeError, "did not start"):
                 self.store.launch("demo", "train.py", [], interval=60)
-        self.assertEqual(self.store._read_job("demo")["state"], "starting")
+        self.assertEqual(self.store._read_job("demo")["state"], "lost")
+
+    def test_a_worker_that_exits_during_startup_is_lost(self):
+        with patch.object(remote.subprocess, "Popen") as popen:
+            popen.return_value.poll.return_value = 1
+            popen.return_value.returncode = 1
+            job = self.store.launch("demo", "train.py", [], interval=60)
+        self.assertEqual(job["state"], "lost")
+        self.assertIn("exited during startup", job["error"])
 
 
 class DetachedWorkerEndToEndTests(unittest.TestCase):

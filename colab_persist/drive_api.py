@@ -30,7 +30,7 @@ BLOCK_BYTES = 4 * 1024 * 1024
 TOKEN_ENV = "COLAB_DRIVE_TOKEN_FILE"
 FOLDER_ENV = "COLAB_DRIVE_FOLDER"
 DEFAULT_TOKEN_FILE = "/dev/shm/colab-persist/drive-token.json"
-FILE_FIELDS = "id,name,size,md5Checksum,sha256Checksum,mimeType,createdTime,appProperties"
+FILE_FIELDS = "id,name,size,md5Checksum,sha256Checksum,mimeType,createdTime,appProperties,parents"
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 RATE_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "backendError"}
 QUOTA_REASONS = {"storageQuotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded",
@@ -146,23 +146,38 @@ class DriveClient:
         return (reasons[0] if reasons else error.get("status")), error.get("message", "")
 
     def request(self, method, url, *, params=None, body=None, headers=None, ok=(200,), stream=False):
-        """Send with bounded retries. Returns (status, headers, payload or response)."""
+        """Send with bounded retries. Returns (status, headers, payload or response).
+
+        A 401 reloads the token once without using up a retry; a second 401 is TokenExpired."""
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-        refreshed = False
-        for attempt in range(self.retries + 1):
+        refreshed, attempt = False, 0
+        while True:
             try:
                 status, response_headers, raw, response = self._send(method, url, body, headers)
             except (urllib.error.URLError, http.client.HTTPException, socket.timeout,
                     ConnectionError, TimeoutError) as error:
-                if attempt == self.retries:
+                if attempt >= self.retries:
                     raise DriveError(f"Drive request failed: {error}") from None
                 self.sleep(min(60, 2 ** attempt))
+                attempt += 1
                 continue
-            if status in ok or (status == 308 and 308 in ok):
+            if status in ok:
                 if stream:
                     return status, response_headers, response
-                payload = response.read() if response is not None else raw
+                if response is None:
+                    return status, response_headers, raw
+                try:
+                    with response:
+                        payload = response.read()
+                except (urllib.error.URLError, http.client.HTTPException, socket.timeout,
+                        ConnectionError, TimeoutError) as error:
+                    # A body cut off mid-read: safe to repeat a read; ambiguous for a write.
+                    if method == "GET" and attempt < self.retries:
+                        self.sleep(min(60, 2 ** attempt))
+                        attempt += 1
+                        continue
+                    raise DriveError(f"Drive response was cut off: {error}") from None
                 return status, response_headers, payload
             reason, message = self._reason(raw)
             if status == 401:
@@ -173,12 +188,11 @@ class DriveClient:
                                    status, reason)
             if status == 403 and reason in QUOTA_REASONS:
                 raise QuotaExceeded(f"Drive quota exhausted ({reason}): {message}", status, reason)
-            if status in RETRY_STATUS or (status == 403 and reason in RATE_REASONS):
-                if attempt < self.retries:
-                    self.sleep(min(60, 2 ** attempt))
-                    continue
+            if (status in RETRY_STATUS or (status == 403 and reason in RATE_REASONS)) and attempt < self.retries:
+                self.sleep(min(60, 2 ** attempt))
+                attempt += 1
+                continue
             raise DriveError(f"Drive {method} failed ({status} {reason}): {message}", status, reason)
-        raise DriveError("Drive request retries exhausted.")
 
     def json(self, method, url, **kwargs):
         _, _, payload = self.request(method, url, **kwargs)
@@ -220,6 +234,12 @@ class DriveClient:
                 return None
             raise
 
+    def trash(self, file_id):
+        """Move one of colab-persist's own files to Drive's trash (recoverable for 30 days)."""
+        return self.json("PATCH", f"{API}/files/{urllib.parse.quote(file_id)}", params={"fields": "id,trashed"},
+                         body=json.dumps({"trashed": True}).encode(),
+                         headers={"Content-Type": "application/json; charset=UTF-8"})
+
     def find_folder(self, parent, name):
         matches = self.children(parent, name=name, folders=True)
         if len(matches) > 1:
@@ -228,14 +248,31 @@ class DriveClient:
                                   "Merge or rename them in Drive, then retry; nothing was changed.")
         return matches[0]["id"] if matches else None
 
+    def generate_id(self):
+        """A file ID chosen before creation, so a retried create cannot make a second file."""
+        return self.json("GET", API + "/files/generateIds", params={"count": 1, "space": "drive"})["ids"][0]
+
+    def _create_once(self, file_id, send):
+        """Run a create that carries a pre-generated ID; a conflict means an earlier try succeeded."""
+        try:
+            return send()
+        except DriveError as error:
+            if error.status != 409:
+                raise
+            existing = self.get(file_id)
+            if not existing or existing.get("trashed"):
+                raise
+            return existing
+
     def ensure_folder(self, parent, name):
         existing = self.find_folder(parent, name)
         if existing:
             return existing
-        created = self.json("POST", API + "/files", params={"fields": "id"},
-                            body=json.dumps({"name": name, "mimeType": FOLDER_MIME,
-                                             "parents": [parent]}).encode(),
-                            headers={"Content-Type": "application/json; charset=UTF-8"})
+        file_id = self.generate_id()
+        created = self._create_once(file_id, lambda: self.json(
+            "POST", API + "/files", params={"fields": "id"},
+            body=json.dumps({"id": file_id, "name": name, "mimeType": FOLDER_MIME, "parents": [parent]}).encode(),
+            headers={"Content-Type": "application/json; charset=UTF-8"}))
         return created["id"]
 
     def resolve(self, parts, *, create=False, root="root"):
@@ -263,12 +300,14 @@ class DriveClient:
 
     def upload_bytes(self, data: bytes, parent, name, *, app_properties=None, mime="application/json"):
         boundary = "colab-persist-" + hashlib.sha256(data).hexdigest()[:24]
-        metadata = {"name": name, "parents": [parent], "appProperties": app_properties or {}}
+        file_id = self.generate_id()
+        metadata = {"id": file_id, "name": name, "parents": [parent], "appProperties": app_properties or {}}
         body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
                 + json.dumps(metadata) + f"\r\n--{boundary}\r\nContent-Type: {mime}\r\n\r\n").encode()
         body += data + f"\r\n--{boundary}--".encode()
-        result = self.json("POST", UPLOAD, params={"uploadType": "multipart", "fields": FILE_FIELDS},
-                           body=body, headers={"Content-Type": f"multipart/related; boundary={boundary}"})
+        result = self._create_once(file_id, lambda: self.json(
+            "POST", UPLOAD, params={"uploadType": "multipart", "fields": FILE_FIELDS},
+            body=body, headers={"Content-Type": f"multipart/related; boundary={boundary}"}))
         return self._verify(result, len(data), hashlib.sha256(data).hexdigest(), hashlib.md5(data).hexdigest())
 
     def upload_file(self, path, parent, name, *, app_properties=None, sha256=None,
@@ -346,10 +385,13 @@ class DriveClient:
                  reserve_check=None):
         """Stream a file to ``destination`` with Range resume; verify size and SHA-256."""
         destination = Path(destination)
-        digest, written = hashlib.sha256(), 0
+        digest, written, completed = hashlib.sha256(), 0, False
         url = f"{API}/files/{urllib.parse.quote(file_id)}?alt=media"
         with destination.open("wb") as target:
             for _ in range(self.retries + 1):
+                if expected_size is not None and written == expected_size:
+                    completed = True  # Everything arrived before the connection dropped.
+                    break
                 headers = {"Range": f"bytes={written}-"} if written else None
                 try:
                     status, _, response = self.request("GET", url, headers=headers, ok=(200, 206), stream=True)
@@ -367,12 +409,17 @@ class DriveClient:
                                 reserve_check(len(block))
                             target.write(block)
                             digest.update(block)
+                    if expected_size is not None and written < expected_size:
+                        continue  # The stream ended early; resume from the bytes already received.
+                    completed = True
                     break
                 except (urllib.error.URLError, http.client.HTTPException, socket.timeout,
                         ConnectionError, TimeoutError):
                     self.sleep(2)
             target.flush()
             os.fsync(target.fileno())
+        if not completed and expected_size is None:
+            raise DriveError("Download did not complete.")
         if expected_size is not None and written != expected_size:
             raise DriveError(f"Downloaded {written} bytes, expected {expected_size}.")
         if expected_sha256 is not None and digest.hexdigest() != expected_sha256:

@@ -145,21 +145,23 @@ class ColabAPI:
                 except ColabAPIError as error:
                     if error.code == "ALREADY_EXISTS":
                         existing = self.get_runtime(runtime_id)
-                        if existing and existing.get("runtimeSpec") == spec:
+                        if not existing or existing.get("runtimeSpec") != spec:
+                            raise
+                        if existing.get("connectionInfo"):
                             return existing
-                        raise
-                    if error.code == "FAILED_PRECONDITION":
+                        # Ours and still starting; keep waiting below.
+                    elif error.code == "FAILED_PRECONDITION":
                         raise ColabAPIError("Colab could not allocate this runtime now: no capacity, quota or "
                                             "compute units, or too many active runtimes. " + str(error),
                                             error.status, error.code, error.reason) from None
-                    if error.code == "RESOURCE_EXHAUSTED" and not started:
+                    elif error.code == "RESOURCE_EXHAUSTED" and not started:
                         raise ColabAPIError("Colab is rate-limiting runtime creation; nothing was created. "
                                             "Wait a few minutes and retry `colab-persist start`.",
                                             error.status, error.code, error.reason) from None
-                    if not (error.code in ("DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED", "UNAVAILABLE")
-                            or error.status in (429, 500, 502, 503, 504)):
+                    elif not (error.code in ("DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED", "UNAVAILABLE")
+                              or error.status in (429, 500, 502, 503, 504)):
                         raise
-                    # The request may have been accepted; keep waiting by reading the runtime.
+                    # Otherwise the request may have been accepted; keep waiting by reading the runtime.
                 else:
                     if operation.get("done"):
                         if operation.get("error"):

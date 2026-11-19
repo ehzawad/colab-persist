@@ -61,7 +61,9 @@ Drive directly with short-lived narrowed tokens rather than through the local ma
    matching, and `stop` reused the imported checkpoint without uploading again.
 7. `run examples/cuda_demo.py --project v04-gpu` on an L4 compiled CUDA, verified 256
    GPU results ("PASS ... NVIDIA L4"), saved with `drive_upload_verified`, and
-   stopped, 47 seconds end to end.
+   stopped, 47 seconds end to end. A second run on a new L4 restored the project
+   and reported count 2 with previous count 1, then saved and stopped; the account
+   finished with zero runtimes.
 
 ### Defects found live and fixed
 
@@ -74,9 +76,25 @@ Drive directly with short-lived narrowed tokens rather than through the local ma
 - The legacy mount helper waited on a dry-run check that keeps reporting
   "unauthorized" after consent; it now polls the real propagation call.
 
-The offline suite (314 tests, fakes for the Colab and Drive APIs) passed on macOS
-with Python 3.14 and 3.12. No account identifiers, project IDs or credentials are
-included in this record.
+### Implementation review
+
+Both councils then reviewed the implemented code independently (Codex reproduced
+each finding with offline experiments). Fixed before release: checkpoint reuse now
+re-fetches both files by ID and requires Drive's SHA-256; hard-linked files are
+archived as regular files; created folder IDs are remembered and folders and
+manifests are created with Drive-generated IDs, so listing lag or a retried request
+cannot duplicate them; a replacement VM is told the last verified pair; the runtime
+ledger is locked and a listing miss is confirmed by ID before a record is dropped;
+a runtime is pending until it has connection details; detached jobs are pinned by
+run ID, a worker that dies at startup or becomes a zombie is reported as lost, and
+permanent Drive errors end a job instead of waiting a day; every minted Drive token
+is checked against the selected account; restore validates manifest paths before
+applying modes; an empty workspace never supersedes a real checkpoint; long imports
+and saves refresh the VM's token; `login` and `setup` wait for newly enabled APIs.
+
+The offline suite (346 tests, fakes for the Colab and Drive APIs) passed on macOS
+with Python 3.14. No account identifiers, project IDs or credentials are included
+in this record.
 
 ## Claude Code integration
 

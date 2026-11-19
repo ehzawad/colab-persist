@@ -18,7 +18,9 @@ class MonitorTests(BackendFixture, unittest.TestCase):
         self.log = io.StringIO()
 
     def statuses(self, *items):
-        return self.start_patch(patch.object(backend, "remote_call", side_effect=list(items)))
+        # A finished job is re-read under the lock before the final save; repeat the last state.
+        final = [items[-1]] if items and isinstance(items[-1], dict) and items[-1].get("state") == "finished" else []
+        return self.start_patch(patch.object(backend, "remote_call", side_effect=[*items, *final]))
 
     def test_follows_the_log_then_saves_and_stops(self):
         call = self.statuses({"state": "running", "log": "epoch 1\n", "offset": 8, "stop_after": True},
@@ -27,7 +29,8 @@ class MonitorTests(BackendFixture, unittest.TestCase):
                               "checkpoint": {"snapshot": "s1"}, "periodic_checkpoint_errors": ["transient"]})
         result = backend.monitor("demo", item=self.runtime, log=self.log)
         self.assertEqual(self.log.getvalue(), "epoch 1\ndone\n")
-        self.assertEqual([c.kwargs["offset"] for c in call.call_args_list], [0, 8, 8])
+        self.assertEqual([c.kwargs["offset"] for c in call.call_args_list[:3]], [0, 8, 8])
+        self.assertEqual(call.call_args_list[3].kwargs["tail"], 0)  # Final recheck under the lock.
         self.save.assert_called_once_with(self.runtime, True)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["checkpoint"], {"snapshot": "s1", "durability": remote.DURABLE})
@@ -69,6 +72,21 @@ class MonitorTests(BackendFixture, unittest.TestCase):
         self.assertEqual(call.call_args_list[0].kwargs["tail"], 4000)
         self.assertEqual(call.call_args_list[1].kwargs["offset"], 4)
         self.assertEqual(self.log.getvalue(), "old\nnew\n")
+
+    def test_a_job_replaced_mid_follow_is_never_finalized(self):
+        self.statuses({"state": "running", "run_id": "A", "log": "", "offset": 0, "stop_after": False},
+                      {"state": "running", "run_id": "B", "log": "", "offset": 0, "stop_after": True})
+        with self.assertRaisesRegex(RuntimeError, "different job replaced"):
+            backend.monitor("demo", item=self.runtime, log=self.log, run_id="A")
+        self.save.assert_not_called()
+
+    def test_finalization_rechecks_the_run_under_the_lock(self):
+        self.start_patch(patch.object(backend, "remote_call", side_effect=[
+            {"state": "finished", "run_id": "A", "checkpoint": {}, "stop_after": True},
+            {"state": "running", "run_id": "B"}]))
+        with self.assertRaisesRegex(RuntimeError, "another job started.*nothing was stopped"):
+            backend.monitor("demo", item=self.runtime, log=self.log, run_id="A")
+        self.save.assert_not_called()
 
     def test_attach_without_a_job(self):
         self.statuses({"state": "none", "project": "demo"})
