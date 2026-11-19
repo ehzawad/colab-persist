@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from colab_persist import datasets
 
+import fakes
+
 
 class DatasetTests(unittest.TestCase):
     def setUp(self):
@@ -307,6 +309,130 @@ except RuntimeError as error:
             with cache.lease(0):
                 pass
         self.assertEqual(external.read_bytes(), b"precious")
+
+
+class DriveDatasetTests(unittest.TestCase):
+    """dataset_root="gdrive://<folder>/datasets": shards are read through the Drive API."""
+
+    ROOT = "gdrive://Colab-Persist/datasets"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.cache = self.base / "cache"
+        self.drive = fakes.FakeDrive()
+
+    def manifest(self, contents, upload=True):
+        rows = []
+        for path, data in contents.items():
+            parts = path.split("/")
+            if upload:
+                self.drive.put(["Colab-Persist", "datasets", *parts[:-1]], parts[-1], data)
+            rows.append({"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        return {"schema": 1, "name": "sample", "version": "v1", "shards": rows}
+
+    def open_cache(self, manifest, budget=64, reserve=0, root=ROOT):
+        return datasets.ShardCache(manifest, dataset_root=root, cache_root=self.cache, cache_bytes=budget,
+                                   reserve_bytes=reserve, drive=self.drive)
+
+    def downloads(self):
+        return [item for operation, item in self.drive.calls if operation == "download"]
+
+    def assert_nothing_published(self, cache):
+        self.assertEqual(list(cache.blobs.iterdir()), [])
+
+    def test_drive_shard_is_downloaded_verified_and_then_served_from_cache(self):
+        manifest = self.manifest({"corpus/v1/a.parquet": b"alpha", "corpus/v1/b.parquet": b"beta"})
+        cache = self.open_cache(manifest)
+        self.drive.calls.clear()
+        with cache.lease(0) as local:
+            self.assertEqual(local.read_bytes(), b"alpha")
+            self.assertEqual(local.stat().st_mode & 0o222, 0)
+        with cache.lease("corpus/v1/a.parquet") as again:
+            self.assertEqual(again, local)
+        self.assertEqual(len(self.downloads()), 1)
+        with cache.lease(1) as other:
+            self.assertEqual(other.read_bytes(), b"beta")
+        # The shard folder is resolved once per cache instance.
+        self.assertEqual(self.drive.calls.count(("children", "Colab-Persist")), 1)
+
+    def test_drive_is_the_default_dataset_root(self):
+        self.assertEqual(datasets.DEFAULT_DATASET_ROOT, "gdrive://Colab-Persist/datasets")
+        manifest = self.manifest({"a.bin": b"data"})
+        with patch.dict(os.environ, {"COLAB_DATASET_ROOT": "gdrive://Colab-Persist/datasets"}):
+            cache = datasets.ShardCache(manifest, cache_root=self.cache, cache_bytes=16, reserve_bytes=0,
+                                        drive=self.drive)
+        with cache.lease(0) as local:
+            self.assertEqual(local.read_bytes(), b"data")
+
+    def test_checksum_reported_by_drive_must_match_the_manifest(self):
+        manifest = self.manifest({"a.bin": b"good"}, upload=False)
+        self.drive.put(["Colab-Persist", "datasets"], "a.bin", b"evil")
+        cache = self.open_cache(manifest)
+        with self.assertRaisesRegex(RuntimeError, "checksum differs from manifest: a.bin"):
+            with cache.lease(0):
+                self.fail("mismatched shard leased")
+        self.assertEqual(self.downloads(), [])
+        self.assert_nothing_published(cache)
+
+    def test_size_reported_by_drive_must_match_the_manifest(self):
+        manifest = self.manifest({"a.bin": b"good"}, upload=False)
+        self.drive.put(["Colab-Persist", "datasets"], "a.bin", b"good and longer")
+        cache = self.open_cache(manifest)
+        with self.assertRaisesRegex(RuntimeError, "size differs from manifest: a.bin"):
+            with cache.lease(0):
+                pass
+        self.assert_nothing_published(cache)
+
+    def test_missing_or_ambiguous_drive_files(self):
+        manifest = self.manifest({"nested/a.bin": b"good"}, upload=False)
+        cache = self.open_cache(manifest)
+        with self.assertRaisesRegex(RuntimeError, "Expected exactly one Drive file for shard nested/a.bin; found 0"):
+            with cache.lease(0):
+                pass
+        self.drive.put(["Colab-Persist", "datasets", "nested"], "a.bin", b"good")
+        self.drive.put(["Colab-Persist", "datasets", "nested"], "a.bin", b"good")
+        with self.assertRaisesRegex(RuntimeError, "found 2"):
+            with self.open_cache(manifest).lease(0):
+                pass
+        self.assert_nothing_published(cache)
+
+    def test_bytes_that_fail_the_download_check_are_never_published(self):
+        manifest = self.manifest({"a.bin": b"good-data"})
+        item = self.drive.by_name("a.bin")
+        self.drive.corrupt(item["id"], b"evil-data", keep_metadata=True)
+        cache = self.open_cache(manifest)
+        with self.assertRaisesRegex(RuntimeError, "checksum differs from manifest: a.bin"):
+            with cache.lease(0):
+                pass
+        self.assert_nothing_published(cache)
+
+    def test_md5_only_metadata_is_still_verified_by_sha256_on_download(self):
+        self.drive.report_sha256 = False
+        manifest = self.manifest({"a.bin": b"good-data", "b.bin": b"more-data"})
+        with self.open_cache(manifest).lease(0) as local:
+            self.assertEqual(local.read_bytes(), b"good-data")
+        self.drive.corrupt(self.drive.by_name("b.bin")["id"], b"evil-data", keep_metadata=True)
+        with self.assertRaisesRegex(RuntimeError, "checksum differs"):
+            with self.open_cache(manifest).lease(1):
+                pass
+
+    def test_disk_reserve_is_checked_during_the_download(self):
+        manifest = self.manifest({"a.bin": b"data"})
+        cache = self.open_cache(manifest, reserve=100)
+        with patch.object(datasets.shutil, "disk_usage",
+                          side_effect=[SimpleNamespace(free=10_000), SimpleNamespace(free=50)]):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient local disk to retain"):
+                with cache.lease(0):
+                    pass
+        self.assert_nothing_published(cache)
+
+    def test_drive_root_must_be_a_clean_relative_path(self):
+        manifest = self.manifest({"a.bin": b"data"})
+        for root in ("gdrive://Colab-Persist/../elsewhere", "gdrive://Colab-Persist//datasets", "gdrive://"):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                self.open_cache(manifest, root=root)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 [project]
 name = "colab-persist"
-version = "0.3.0"
-description = "Drive checkpoints for disposable Colab runtimes, with a local MCP server and client"
+version = "0.4.0"
+description = "Verified Google Drive checkpoints for disposable Colab runtimes on the official Colab API, with a local MCP server and client"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["mcp==2.2.0", "google-colab-cli==0.7.4"]
+dependencies = ["mcp==2.2.0", "google-auth>=2.40,<3", "requests>=2.32,<3", "websocket-client>=1.8,<2"]
 
 [project.scripts]
 colab-persist = "colab_persist.client:main"

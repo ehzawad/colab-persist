@@ -1,8 +1,10 @@
-"""Local control plane. Credentials stay on the Mac; the VM receives only project files."""
+"""Local control plane. Credentials stay on this computer; the VM receives project
+files and short-lived Drive tokens only."""
 from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -15,17 +17,24 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 
-from google.auth.transport.requests import AuthorizedSession
-from colab_cli.client import Client, Prod
-from . import accounts, datasets, remote, session_state
+from . import accounts, colab_api, datasets, drive_api, remote, runtimes
 
 CONFIG_DIR = Path.home() / ".config" / "colab-persist"
-REMOTE_ENGINE = "/content/.colab-persist/remote.py"
+ENGINE_ROOT = remote.ENGINE_ROOT
+ENGINE_COMMAND = f"cd {ENGINE_ROOT} && python3 -m colab_persist.remote"
+ENGINE_FILES = ("__init__.py", "remote.py", "drive_api.py", "datasets.py", "checkpoints.py")
 SSH_CONTROL_DIR = Path.home() / ".ssh"
 SSH_BUSY = ("Already-active SSH session", "HTTP 429")
+LEGACY_CLI = "google-colab-cli==0.7.4"
+POLL_SECONDS = 10
+TOKEN_MARGIN_SECONDS = 15 * 60
+TERMINAL_JOB_STATES = {"finished", "exited_unsaved", "refused", "none", "lost"}
+_TOKENS: dict = {}
 
 
+# -- configuration ---------------------------------------------------------------------
 def config():
     path = CONFIG_DIR / "config.json"
     if not path.exists():
@@ -34,12 +43,30 @@ def config():
     if not value.get("expected_email"):
         raise RuntimeError("The configuration must specify expected_email.")
     accounts.normalize_email(value["expected_email"])
+    if value.get("storage") != 2:
+        # v0.3 wrote through Colab's own Drive mount. drive.file cannot see that folder, so the
+        # API keeps checkpoints in a separate folder and import-legacy copies old ones over.
+        value["legacy_drive_folder"] = value.get("drive_folder", remote.LEGACY_FOLDER)
+        value["drive_folder"] = remote.DEFAULT_FOLDER
+        value["storage"] = 2
+    value.setdefault("drive_folder", remote.DEFAULT_FOLDER)
+    value.setdefault("legacy_drive_folder", remote.LEGACY_FOLDER)
     remote.valid_name(value.get("session", "cuda"))
-    remote.valid_name(value.get("drive_folder", "Colab-CUDA"))
+    remote.valid_name(value["drive_folder"])
+    remote.valid_name(value["legacy_drive_folder"])
     limit = value.get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
     if type(limit) is not int or limit <= 0:
         raise ValueError("snapshot_limit_bytes must be a positive integer.")
+    meta = accounts.meta(CONFIG_DIR, value["expected_email"])
+    value["scopes"] = list(accounts.login_scopes(bool(meta.get("full_drive"))))
     return value
+
+
+def write_config(value):
+    stored = {k: v for k, v in value.items() if k != "scopes"}
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    remote.write_json(CONFIG_DIR / "config.json", stored)
+    (CONFIG_DIR / "config.json").chmod(0o600)
 
 
 @contextlib.contextmanager
@@ -56,35 +83,130 @@ def operation_lock():
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def waiting_lock(seconds=300):
+    """Like operation_lock, but waits for a short concurrent command (such as status) to finish."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    deadline = time.monotonic() + seconds
+    with (CONFIG_DIR / "operation.lock").open("a") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Another persistence operation is active. Wait for it to finish.") from None
+                time.sleep(2)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def quota_project(cfg):
+    project = accounts.meta(CONFIG_DIR, cfg["expected_email"]).get("quota_project")
+    if not project:
+        raise RuntimeError("No Cloud project is set for this account. Run `colab-persist setup --project "
+                           "YOUR_PROJECT_ID` once (free; enables the Colab and Drive APIs, no billing).")
+    return project
+
+
+def full_drive(cfg):
+    return bool(accounts.meta(CONFIG_DIR, cfg["expected_email"]).get("full_drive"))
+
+
+def api_for(cfg, credentials=None):
+    return colab_api.ColabAPI(credentials or accounts.verified_credentials(cfg), quota_project(cfg))
+
+
+def drive_token(cfg):
+    """A cached short-lived Drive token; refreshed when less than 15 minutes remain."""
+    key = (cfg["expected_email"], cfg["drive_folder"])
+    token = _TOKENS.get(key)
+    if not token or token["expires_at"] - time.time() < TOKEN_MARGIN_SECONDS:
+        token = accounts.drive_token(cfg, quota_project(cfg), cfg["drive_folder"], full_drive=full_drive(cfg))
+        _TOKENS[key] = token
+    return dict(token)
+
+
+def local_drive(cfg):
+    token = drive_token(cfg)
+    return drive_api.DriveClient(drive_api.TokenSource(token["token"], token["quota_project"]))
+
+
+def check_drive_identity(cfg, drive=None):
+    about = (drive or local_drive(cfg)).about()
+    email = about.get("user", {}).get("emailAddress", "").lower()
+    if email != cfg["expected_email"].lower():
+        raise RuntimeError(f"Drive account mismatch: expected {cfg['expected_email']}, got {email or 'none'}. "
+                           "Nothing was written.")
+    return about
+
+
 def identity():
     cfg = config()
     accounts.verified_credentials(cfg)
     return cfg["expected_email"].lower()
 
 
-def assignments_for(cfg):
+# -- accounts --------------------------------------------------------------------------
+def verify_account(cfg, project):
     credentials = accounts.verified_credentials(cfg)
-    with AuthorizedSession(credentials) as session:
-        return Client(Prod(), session).list_assignments()
+    result = {"account": cfg["expected_email"], "account_verified": True}
+    if not project:
+        return {**result, "drive_ready": False, "next": "colab-persist setup --project YOUR_PROJECT_ID"}
+    api = colab_api.ColabAPI(credentials, project)
+    try:
+        listed = api.list_runtimes()
+    except colab_api.ColabAPIError as error:
+        if error.reason != "SERVICE_DISABLED":
+            raise
+        api.enable_services(project)  # First use of this project: enable the two free APIs.
+        for attempt in range(12):  # Newly enabled APIs can take a minute to take effect.
+            try:
+                listed = api.list_runtimes()
+                break
+            except colab_api.ColabAPIError as retry_error:
+                if retry_error.reason != "SERVICE_DISABLED" or attempt == 11:
+                    raise
+                time.sleep(5)
+    result["active_runtimes"] = len(listed)
+    full = cfg.get("_full_drive", False)
+    token = accounts.drive_token(cfg, project, cfg["drive_folder"], full_drive=full)
+    drive = drive_api.DriveClient(drive_api.TokenSource(token["token"], project))
+    check_drive_identity(cfg, drive)
+    return {**result, "drive_ready": True}
 
 
-def login(email, *, reauth=False, no_launch_browser=False, no_switch=False):
-    """Verify and save private credentials, optionally selecting that account."""
+def login(email, *, reauth=False, no_launch_browser=False, no_switch=False, project=None,
+          client_id_file=None):
+    """Verify and save private credentials (Colab + Drive), optionally selecting that account."""
     email = accounts.normalize_email(email)
     with operation_lock():
         previous = config()
         switching = not no_switch and email != previous["expected_email"].lower()
 
         def require_old_account_stopped():
-            if switching and assignments_for(previous):
+            if not switching:
+                return
+            try:
+                active = api_for(previous).list_runtimes()
+            except Exception as error:
+                raise RuntimeError("Could not verify that the current account has no running Colab runtimes; "
+                                   "switching refused. " + str(error)) from None
+            if active:
                 raise RuntimeError("The current Google account still has active Colab runtimes. "
                                    "Save and stop them before switching accounts.")
 
         require_old_account_stopped()
-        directory = session_state.session_path(CONFIG_DIR, email).parent
+        directory = accounts.account_dir(CONFIG_DIR, email)
         saved = directory / "credentials.json"
-        candidate = {**previous, "expected_email": email, "credentials_file": str(saved)}
-        if reauth or not saved.exists():
+        full = bool(client_id_file)
+        account_meta = accounts.meta(CONFIG_DIR, email)
+        project = project or account_meta.get("quota_project")
+        candidate = {**previous, "expected_email": email, "credentials_file": str(saved),
+                     "scopes": list(accounts.login_scopes(full)), "_full_drive": full}
+        if reauth or not saved.exists() or full != bool(account_meta.get("full_drive")):
             # Isolate gcloud's ADC output and configuration; the user's normal ADC
             # and gcloud account selection are never overwritten.
             with tempfile.TemporaryDirectory(prefix="login-", dir=directory) as temporary:
@@ -92,7 +214,9 @@ def login(email, *, reauth=False, no_launch_browser=False, no_switch=False):
                 env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
                 env["CLOUDSDK_CONFIG"] = temporary
                 command = ["gcloud", "auth", "application-default", "login", email,
-                           "--disable-quota-project", "--scopes=" + ",".join(accounts.SCOPES)]
+                           "--disable-quota-project", "--scopes=" + ",".join(accounts.login_scopes(full))]
+                if client_id_file:
+                    command.append("--client-id-file=" + str(Path(client_id_file).expanduser().absolute()))
                 if no_launch_browser:
                     command.append("--no-launch-browser")
                 result = subprocess.run(command, env=env)
@@ -100,32 +224,127 @@ def login(email, *, reauth=False, no_launch_browser=False, no_switch=False):
                     raise RuntimeError("Google login did not finish; account selection is unchanged.")
                 staged = Path(temporary) / "application_default_credentials.json"
                 candidate["credentials_file"] = str(staged)
-                assignments = assignments_for(candidate)  # Verify email and Colab access before committing.
+                verification = verify_account(candidate, project)  # Before committing anything.
                 require_old_account_stopped()  # A runtime may have started during browser consent.
                 staged.chmod(0o600)
                 staged.replace(saved)
         else:
-            assignments = assignments_for(candidate)
+            verification = verify_account(candidate, project)
             require_old_account_stopped()
         candidate["credentials_file"] = str(saved)
+        candidate.pop("_full_drive", None)
+        accounts.save_meta(CONFIG_DIR, email, full_drive=full, **({"quota_project": project} if project else {}))
+        _TOKENS.clear()
         if not no_switch:
-            remote.write_json(CONFIG_DIR / "config.json", candidate)
-            (CONFIG_DIR / "config.json").chmod(0o600)
-        return {"account": email, "account_verified": True, "switched": switching,
+            write_config(candidate)
+        return {**verification, "switched": switching,
                 "selected_account": previous["expected_email"] if no_switch else email,
-                "saved_only": no_switch,
-                "active_runtimes": len(assignments), "global_gcloud_credentials_changed": False,
-                "next": "colab-persist login --email " + email if no_switch else "colab-persist status"}
+                "saved_only": no_switch, "drive_scope": "drive" if full else "drive.file",
+                "global_gcloud_credentials_changed": False,
+                "next": verification.get("next") or ("colab-persist login --email " + email if no_switch
+                                                     else "colab-persist status")}
 
 
-def colab_command():
-    executable = Path(sys.executable).parent / "colab"
-    if not executable.exists():
-        executable = Path(shutil.which("colab") or "")
-    if not executable.is_file():
-        raise RuntimeError("Install google-colab-cli in this environment first.")
-    return [str(executable), "--auth", "adc", "--config",
-            str(session_state.session_path(CONFIG_DIR, config()["expected_email"]))]
+def setup(project):
+    """Enable the two free APIs on the user's Cloud project and remember it for this account."""
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError("Provide your Google Cloud project ID.")
+    project = project.strip()
+    with operation_lock():
+        cfg = config()
+        credentials = accounts.verified_credentials(cfg)
+        api = colab_api.ColabAPI(credentials, project)
+        services = api.enable_services(project)
+        accounts.save_meta(CONFIG_DIR, cfg["expected_email"], quota_project=project)
+        _TOKENS.clear()
+        tier = api.subscription()
+        result = {"account": cfg["expected_email"], "project_saved": True, "services": services,
+                  "colab_tier": tier.replace("SUBSCRIPTION_TIER_", "").lower()}
+        try:
+            check_drive_identity(cfg)
+            result["drive_ready"] = True
+        except RuntimeError as error:
+            result.update(drive_ready=False, drive_error=str(error))
+        write_config(cfg)
+        return result
+
+
+# -- runtimes --------------------------------------------------------------------------
+def managed_runtime(cfg, api):
+    """(managed runtime or None, every runtime on the account, pending creation record)."""
+    email, session = cfg["expected_email"], cfg.get("session", "cuda")
+    everything = api.list_runtimes()
+    by_id = {colab_api.runtime_id_of(r): r for r in everything}
+    ledger = runtimes.load(CONFIG_DIR, email)
+    record = ledger.get(session)
+    if record and record["runtime_id"] in by_id:
+        runtime = by_id[record["runtime_id"]]
+        if record.get("state") == "pending" and runtime.get("connectionInfo"):
+            runtimes.mark_ready(CONFIG_DIR, email, session, record["runtime_id"],
+                                colab_api.endpoint_from_url(runtime["connectionInfo"]["url"]))
+        return runtime, everything, None
+    if record and record.get("state") == "ready":
+        # Deleted elsewhere or reclaimed by Google; forget only our own ledger entry.
+        runtimes.forget(CONFIG_DIR, email, session, record["runtime_id"])
+        record = None
+    if record is None:
+        # A creation given up on earlier may still have produced a VM. It is ours by its exact ID.
+        candidates = sorted(((rid, old) for rid, old in ledger.get(runtimes.ABANDONED, {}).items()
+                             if rid in by_id and old.get("session") == session and
+                             by_id[rid].get("connectionInfo")),
+                            key=lambda item: item[1].get("created_at", ""), reverse=True)
+        if candidates:
+            runtime_id = candidates[0][0]
+            runtimes.adopt(CONFIG_DIR, email, session, runtime_id,
+                           colab_api.endpoint_from_url(by_id[runtime_id]["connectionInfo"]["url"]))
+            return by_id[runtime_id], everything, None
+    runtimes.prune_abandoned(CONFIG_DIR, email, set(by_id))
+    return None, everything, record
+
+
+def runtime_info():
+    cfg = config()
+    runtime, _, _ = managed_runtime(cfg, api_for(cfg))
+    return runtime
+
+
+def require_runtime():
+    item = runtime_info()
+    if item is None:
+        raise RuntimeError("No managed runtime is active. Run `colab-persist start`.")
+    return item
+
+
+def specs():
+    cfg = config()
+    api = api_for(cfg)
+    items = api.runtime_specs()
+    return {"account": cfg["expected_email"], "tier": api.subscription().replace("SUBSCRIPTION_TIER_", "").lower(),
+            "eligible": sorted(colab_api.spec_label(s["key"]) for s in items if s.get("eligible")),
+            "not_eligible": sorted(colab_api.spec_label(s["key"]) for s in items if not s.get("eligible")),
+            "default_gpu": cfg.get("gpu", "L4")}
+
+
+def list_sessions():
+    with operation_lock():
+        cfg = config()
+        api = api_for(cfg)
+        runtime, everything, pending = managed_runtime(cfg, api)
+        managed_id = colab_api.runtime_id_of(runtime) if runtime else None
+        abandoned = runtimes.abandoned(CONFIG_DIR, cfg["expected_email"])
+        result = {"account": cfg["expected_email"], "account_verified": True,
+                  "active_runtimes": len(everything), "pending_creation": bool(pending),
+                  "sessions": [{"runtime": colab_api.runtime_id_of(item),
+                                "spec": colab_api.spec_label(item.get("runtimeSpec", {})),
+                                "managed": colab_api.runtime_id_of(item) == managed_id,
+                                "name": cfg.get("session", "cuda") if colab_api.runtime_id_of(item) == managed_id else None,
+                                **({"abandoned_creation": True} if colab_api.runtime_id_of(item) in abandoned else {})}
+                               for item in everything]}
+        if any(item.get("abandoned_creation") for item in result["sessions"]):
+            result["warning"] = ("A runtime colab-persist started earlier is running unmanaged and using compute "
+                                 "units. Delete it in Colab (Runtime > Manage sessions), or stop the managed "
+                                 "runtime so the next command adopts it.")
+        return result
 
 
 def checked(arguments, *, data=None, timeout=180, env=None):
@@ -142,62 +361,54 @@ def checked(arguments, *, data=None, timeout=180, env=None):
     return result.stdout
 
 
-def session_info():
-    cfg = config()
-    credentials = accounts.verified_credentials(cfg)
-    sessions, _ = session_state.synced_state(CONFIG_DIR, cfg, credentials)
-    return sessions.get(cfg.get("session", "cuda"))
-
-
-def list_sessions():
-    with operation_lock():
-        cfg = config()
-        credentials = accounts.verified_credentials(cfg)
-        sessions, assignments = session_state.synced_state(CONFIG_DIR, cfg, credentials)
-        names = {item.endpoint: name for name, item in sessions.items()}
-        return {"account": cfg["expected_email"], "account_verified": True,
-                "active_runtimes": len(assignments), "sessions": [
-                    {"endpoint": item.endpoint, "name": names.get(item.endpoint),
-                     "managed": names.get(item.endpoint) == cfg.get("session", "cuda")}
-                    for item in assignments]}
-
-
-def require_session():
-    item = session_info()
-    if item is None:
-        raise RuntimeError("No managed runtime is active. Run `colab-persist start`.")
-    return item
-
-
 def control_path(item):
     """One SSH connection per runtime, shared by colab-persist and the `colab-cuda` alias. Colab
     accepts a single SSH session per runtime, so separate connections would refuse each other
-    (HTTP 429); multiplexed sessions ride on whichever connection is already open."""
-    return SSH_CONTROL_DIR / ("cm-colab-" + item.endpoint)
+    (HTTP 429). The name is hashed to stay within macOS's 104-byte socket path limit."""
+    digest = hashlib.sha256(colab_api.runtime_id_of(item).encode()).hexdigest()[:16]
+    return SSH_CONTROL_DIR / ("cm-cp-" + digest)
+
+
+def proxy_command(item):
+    return shlex.join([sys.executable, "-m", "colab_persist.proxy", "--runtime", colab_api.runtime_id_of(item)])
 
 
 def ssh_command(item):
     cfg = config()
     key = str(Path(cfg.get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser())
-    proxy = shlex.join([sys.executable, "-m", "colab_persist.proxy", "--endpoint", item.endpoint])
     return ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", key,
             "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3", "-o", "ForwardAgent=no",
             "-o", "UserKnownHostsFile=" + str(Path.home() / ".ssh/known_hosts_colab_persist"),
-            "-o", "HostKeyAlias=colab-" + item.endpoint,
+            "-o", "HostKeyAlias=colab-" + colab_api.runtime_id_of(item),
             # A backgrounded master (ControlPersist) lets this command return even while an
             # interactive session multiplexes on the same connection; it lingers 30 s after the last.
             "-o", "ControlMaster=auto", "-o", "ControlPath=" + str(control_path(item)),
             "-o", "ControlPersist=30",
-            "-o", "ProxyCommand=" + proxy, "root@colab-runtime"]
+            "-o", "ProxyCommand=" + proxy_command(item), "root@colab-runtime"]
 
 
-def remote_call(operation, *, item=None, **parameters):
-    item = item or require_session()
-    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"),
-               "snapshot_limit": config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT), **parameters}
-    raw = checked([*ssh_command(item), "python3 " + REMOTE_ENGINE],
-                  data=json.dumps(request).encode(), timeout=900).decode(errors="replace")
+def close_ssh(item):
+    subprocess.run(["ssh", "-o", "ControlPath=" + str(control_path(item)), "-O", "exit", "root@colab-runtime"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def remote_call(operation, *, item=None, timeout=900, **parameters):
+    cfg = config()
+    item = item or require_runtime()
+    request = {"operation": operation, "folder": cfg["drive_folder"],
+               "snapshot_limit": cfg.get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT),
+               "drive": drive_token(cfg), **parameters}
+    try:
+        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=json.dumps(request).encode(),
+                      timeout=timeout).decode(errors="replace")
+    except RuntimeError as error:
+        if "No module named colab_persist" not in str(error) and "can't cd to" not in str(error) \
+                and "No such file or directory" not in str(error):
+            raise
+        install_engine(item)  # A runtime adopted after an interrupted start has no engine yet.
+        raw = checked([*ssh_command(item), ENGINE_COMMAND], data=json.dumps(request).encode(),
+                      timeout=timeout).decode(errors="replace")
     return parse_result(raw, operation)
 
 
@@ -217,46 +428,33 @@ def parse_result(raw, operation=None):
     return json.loads(results[-1])
 
 
-def kernel_call(operation, *, item, timeout=900, **parameters):
-    request = {"operation": operation, "folder": config().get("drive_folder", "Colab-CUDA"),
-               "snapshot_limit": config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT), **parameters}
-    code = ("import importlib.util\n"
-            f"import sys; sys.path.insert(0, {str(Path(REMOTE_ENGINE).parent)!r})\n"
-            f"_spec = importlib.util.spec_from_file_location('_persist_engine', {REMOTE_ENGINE!r})\n"
-            "_engine = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(_engine)\n"
-            f"_engine.dispatch({request!r})\n")
-    with tempfile.TemporaryDirectory(prefix="colab-persist-") as temporary:
-        script = Path(temporary) / "operation.py"
-        script.write_text(code)
-        raw = checked([*colab_command(), "exec", "-s", item.name, "-f", str(script),
-                       "--timeout", str(timeout)], timeout=timeout + 60,
-                      env=accounts.environment(config())).decode(errors="replace")
-    return parse_result(raw, operation)
-
-
 def install_engine(item):
+    cfg = config()
     source = io.BytesIO()
+    package = Path(remote.__file__).parent
     with tarfile.open(fileobj=source, mode="w") as archive:
-        archive.add(remote.__file__, arcname="remote.py")
-        package = Path(remote.__file__).parent
-        for name in ("__init__.py", "remote.py", "datasets.py", "checkpoints.py"):
+        for name in ENGINE_FILES:
             archive.add(package / name, arcname="colab_persist/" + name)
-    for attempt in range(3):
+    for attempt in range(6):
         try:
-            checked([*ssh_command(item), "mkdir -p /content/.colab-persist && tar -xf - -C /content/.colab-persist"],
+            checked([*ssh_command(item), f"mkdir -p {ENGINE_ROOT} && tar -xf - -C {ENGINE_ROOT}"],
                     data=source.getvalue())
             break
         except RuntimeError:
-            if attempt == 2:
+            if attempt == 5:
                 raise
-            time.sleep(2)
+            time.sleep(2 * (attempt + 1))  # A fresh VM's SSH service can take a few seconds.
+    folder = cfg["drive_folder"]
     # SSH shells do not inherit the notebook's CUDA library path.
-    setup = b'''set -e
+    setup = f'''set -e
 cat > /etc/profile.d/colab-cuda.sh <<'CUDA'
 export PATH="/usr/local/cuda/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/lib64-nvidia:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export PYTHONPATH="/content/.colab-persist${PYTHONPATH:+:$PYTHONPATH}"
-export HF_HOME="${HF_HOME:-/content/colab-persist-cache/huggingface}"
+export LD_LIBRARY_PATH="/usr/lib64-nvidia:/usr/local/cuda/lib64${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+export PYTHONPATH="{ENGINE_ROOT}${{PYTHONPATH:+:$PYTHONPATH}}"
+export HF_HOME="${{HF_HOME:-/content/colab-persist-cache/huggingface}}"
+export {drive_api.TOKEN_ENV}="{drive_api.DEFAULT_TOKEN_FILE}"
+export {drive_api.FOLDER_ENV}="{folder}"
+export COLAB_DATASET_ROOT="${{COLAB_DATASET_ROOT:-gdrive://{folder}/datasets}}"
 CUDA
 python3 - <<'PY'
 from pathlib import Path
@@ -266,7 +464,7 @@ old = p.read_text() if p.exists() else ''
 if line not in old:
     p.write_text(line + old)
 PY
-'''
+'''.encode()
     checked([*ssh_command(item), "bash -s"], data=setup)
 
 
@@ -276,16 +474,15 @@ def write_ssh_alias(item):
         return
     target = Path(destination).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    proxy = shlex.join([sys.executable, "-m", "colab_persist.proxy", "--endpoint", item.endpoint])
     key = Path(config().get("ssh_identity", "~/.ssh/id_ed25519_colab")).expanduser()
-    target.write_text(f'''# Managed by colab-persist start. Endpoint-specific host key pinning.
+    target.write_text(f'''# Managed by colab-persist start. Runtime-specific host key pinning.
 Host colab-cuda
   HostName colab-runtime
-  HostKeyAlias colab-{item.endpoint}
+  HostKeyAlias colab-{colab_api.runtime_id_of(item)}
   User root
   IdentityFile "{key}"
   IdentitiesOnly yes
-  ProxyCommand {proxy}
+  ProxyCommand {proxy_command(item)}
   StrictHostKeyChecking accept-new
   UserKnownHostsFile ~/.ssh/known_hosts_colab_persist
   ServerAliveInterval 30
@@ -298,90 +495,126 @@ Host colab-cuda
     target.chmod(0o600)
 
 
-def start_runtime(gpu=None):
+def start_runtime(gpu=None, tpu=None, cpu=False, high_mem=False):
     with operation_lock():
-        selected = gpu or config().get("gpu", "L4")
-        if selected not in {"T4", "L4", "G4", "H100", "A100"}:
-            raise ValueError("GPU must be T4, L4, G4, H100 or A100.")
-        item = session_info()
-        created = item is None
-        if item is not None and item.accelerator.upper() != selected.upper():
-            raise RuntimeError(f"Runtime already uses {item.accelerator}. Save and stop it before selecting {selected}.")
-        if created:
-            cfg = config()
-            checked([*colab_command(), "new", "-s", cfg.get("session", "cuda"),
-                     "--gpu", selected], timeout=300, env=accounts.environment(cfg))
-            item = require_session()
-        install_engine(item)
-        write_ssh_alias(item)
-        return {"session": item.name, "endpoint": item.endpoint, "gpu": item.accelerator, "created": created,
-                **remote_call("status", item=item)}
+        cfg = config()
+        credentials = accounts.verified_credentials(cfg)
+        api = api_for(cfg, credentials)
+        chosen_gpu = gpu or (None if (tpu or cpu) else cfg.get("gpu", "L4"))
+        want = colab_api.wanted_spec(chosen_gpu, tpu, cpu, high_mem)  # Refuses conflicting choices.
+        runtime, _, pending = managed_runtime(cfg, api)
+        created = False
+        if runtime is None and pending is not None:
+            # Finish an interrupted creation first, so it can never run on unrecorded.
+            try:
+                runtime = api.create_runtime(pending["runtime_id"], pending["request_id"], pending["spec"],
+                                             resume=True)
+            except colab_api.ColabAPIError as error:
+                if error.code == "PENDING":
+                    raise
+                # Remember the ID: if that VM still appears, it is adopted rather than left running.
+                runtimes.abandon(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"),
+                                 pending["runtime_id"])
+                raise
+            else:
+                runtimes.mark_ready(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"),
+                                    colab_api.runtime_id_of(runtime),
+                                    colab_api.endpoint_from_url(runtime["connectionInfo"]["url"]))
+                created = True
+        if runtime is not None:
+            if runtime.get("runtimeSpec") != want:
+                raise RuntimeError(f"Runtime already uses {colab_api.spec_label(runtime.get('runtimeSpec', {}))}. "
+                                   f"Save and stop it before selecting {colab_api.spec_label(want)}.")
+        else:
+            key = colab_api.choose_spec(api.runtime_specs(), want)
+            check_drive_identity(cfg)  # Confirm Drive before spending compute units.
+            record = runtimes.begin(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"), key)
+            try:
+                runtime = api.create_runtime(record["runtime_id"], record["request_id"], key)
+            except colab_api.ColabAPIError as error:
+                if error.code != "PENDING":
+                    # Remember the ID: if that VM still appears, it is adopted rather than left running.
+                    runtimes.abandon(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"),
+                                     record["runtime_id"])
+                raise
+            runtimes.mark_ready(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"),
+                                colab_api.runtime_id_of(runtime),
+                                colab_api.endpoint_from_url(runtime["connectionInfo"]["url"]))
+            created = True
+        install_engine(runtime)
+        write_ssh_alias(runtime)
+        return {"session": cfg.get("session", "cuda"), "runtime": colab_api.runtime_id_of(runtime),
+                "gpu": colab_api.spec_label(runtime.get("runtimeSpec", {})), "created": created,
+                **remote_call("status", item=runtime)}
 
 
 def status():
     with operation_lock():
         cfg = config()
         credentials = accounts.verified_credentials(cfg)
-        sessions, assignments = session_state.synced_state(CONFIG_DIR, cfg, credentials)
-        item = sessions.get(cfg.get("session", "cuda"))
+        api = api_for(cfg, credentials)
+        runtime, everything, pending = managed_runtime(cfg, api)
         summary = {"account": cfg["expected_email"], "account_verified": True,
-                   "active_runtimes": len(assignments)}
-        if item is None:
-            return {**summary, "active": False,
-                    "next": "colab-persist sessions" if assignments else "colab-persist start"}
-        return {**summary, "active": True,
-                "session": item.name, "endpoint": item.endpoint, **remote_call("status", item=item)}
-
-
-# Colab's first drive.mount() right after a fresh consent often fails ("ValueError: mount failed")
-# while the new credentials propagate; a later attempt with the same authorization succeeds.
-MOUNT_ATTEMPTS, MOUNT_RETRY_PAUSE_S = 3, 5
+                   "active_runtimes": len(everything), "drive_folder": f"My Drive/{cfg['drive_folder']}"}
+        if runtime is None:
+            return {**summary, "active": False, "pending_creation": bool(pending),
+                    "next": "colab-persist start" if not everything or pending else "colab-persist sessions"}
+        return {**summary, "active": True, "session": cfg.get("session", "cuda"),
+                "runtime": colab_api.runtime_id_of(runtime),
+                "gpu": colab_api.spec_label(runtime.get("runtimeSpec", {})),
+                **remote_call("status", item=runtime)}
 
 
 def mount_drive():
-    """Terminal-only consent flow. Never read OAuth codes through MCP/chat."""
+    """Connect Drive from this computer: no browser and no VM mount needed."""
     with operation_lock():
-        item = require_session()
-        if remote_call("status", item=item)["drive_mounted"]:
-            return {"drive_mounted": True}
-        for attempt in range(MOUNT_ATTEMPTS):
-            completed = subprocess.run([*colab_command(), "drivemount", "-s", item.name],
-                                       env=accounts.environment(config()))
-            if completed.returncode == 0 and remote_call("status", item=item)["drive_mounted"]:
-                return {"drive_mounted": True}
-            if attempt + 1 < MOUNT_ATTEMPTS:
-                print("Drive did not finish mounting. A 'ValueError: mount failed' traceback just after consent is "
-                      "Colab's first mount racing the new credentials, not a problem with your authorization. "
-                      f"Retrying in {MOUNT_RETRY_PAUSE_S} s with the completed authorization "
-                      f"(attempt {attempt + 2} of {MOUNT_ATTEMPTS}).", file=sys.stderr)
-                time.sleep(MOUNT_RETRY_PAUSE_S)
-        raise RuntimeError("Drive mount did not complete. Run `colab-persist mount` again.")
+        cfg = config()
+        drive = local_drive(cfg)
+        about = check_drive_identity(cfg, drive)
+        result = {"drive_connected": True, "drive_mode": "api", "drive_mounted": False,
+                  "drive_folder": f"My Drive/{cfg['drive_folder']}", "browser_consent_needed": False,
+                  "drive_email": about["user"]["emailAddress"]}
+        runtime = runtime_info()
+        if runtime is not None:
+            vm = remote_call("connect", item=runtime)
+            if (vm.get("drive_email") or "").lower() != cfg["expected_email"].lower():
+                raise RuntimeError("The VM reached a different Drive account; nothing was written.")
+            result["vm_connected"] = True
+        return result
 
 
+# -- persistence -----------------------------------------------------------------------
 def save_and_stop(*, stop=True):
     with operation_lock():
-        item = require_session()
+        item = require_runtime()
         return _save_and_stop(item, stop)
 
 
 def _save_and_stop(item, stop):
-    receipt = kernel_call("seal", item=item)
-    # nothing_to_save: no managed workspace and Drive not mounted, so no managed data or pending
-    # Drive write can be lost. Unmanaged files are never captured, as in every other stop.
+    receipt = remote_call("seal", item=item)
+    # nothing_to_save: no managed workspace, so no managed data can be lost. Unmanaged
+    # files are never captured, as in every other stop.
     nothing = bool(receipt.get("nothing_to_save"))
-    if not receipt.get("drive_flushed") and not nothing:
-        raise RuntimeError("Drive did not confirm its flush. Shutdown refused.")
+    if not receipt.get("drive_upload_verified") and not nothing:
+        raise RuntimeError("Drive did not verify every checkpoint upload. Shutdown refused.")
     if not nothing:
         # Keep a small local receipt for diagnosis; the data itself lives in Drive.
-        remote.write_json(CONFIG_DIR / "last-save.json", receipt)
+        remote.write_json(CONFIG_DIR / "last-save.json",
+                          {**{k: v for k, v in receipt.items() if k != "checkpoints"},
+                           "checkpoints": [checkpoint_summary(s) for s in receipt["checkpoints"]]})
         (CONFIG_DIR / "last-save.json").chmod(0o600)
     if stop:
-        if require_session().endpoint != item.endpoint:
+        cfg = config()
+        current = require_runtime()
+        if colab_api.runtime_id_of(current) != colab_api.runtime_id_of(item):
             raise RuntimeError("Runtime changed during saving. Refusing to stop a different VM.")
-        checked([*colab_command(), "stop", "-s", item.name], timeout=180,
-                env=accounts.environment(config()))
-    return {"stopped": stop, "drive_flushed": bool(receipt.get("drive_flushed")), "nothing_to_save": nothing,
-            "flushed_at": receipt.get("flushed_at"),
+        api_for(cfg).delete_runtime(colab_api.runtime_id_of(item))
+        close_ssh(item)
+        runtimes.forget(CONFIG_DIR, cfg["expected_email"], cfg.get("session", "cuda"),
+                        colab_api.runtime_id_of(item))
+    return {"stopped": stop, "drive_upload_verified": bool(receipt.get("drive_upload_verified")),
+            "drive_flushed": bool(receipt.get("drive_flushed")), "nothing_to_save": nothing,
+            "verified_at": receipt.get("verified_at"), "flushed_at": receipt.get("flushed_at"),
             "checkpoints": [checkpoint_summary(s) for s in receipt["checkpoints"]]}
 
 
@@ -390,7 +623,35 @@ def checkpoint_summary(item):
 
 
 def snapshots(project):
-    return [checkpoint_summary(s) for s in remote_call("snapshots", project=remote.valid_name(project))]
+    """List complete checkpoints straight from Drive on this computer; no VM needed."""
+    cfg = config()
+    drive = local_drive(cfg)
+    folder = drive.resolve([cfg["drive_folder"], "projects", remote.valid_name(project)])
+    if folder is None:
+        return []
+    files = drive.children(folder, folders=False)
+    archives = {}
+    for item in files:
+        if item["name"].endswith(".tar.gz"):
+            archives.setdefault(item["name"][:-7], []).append(item)
+    result = []
+    for item in sorted((f for f in files if f["name"].endswith(".json")), key=lambda f: f["name"], reverse=True):
+        snapshot = item["name"][:-5]
+        props = item.get("appProperties") or {}
+        if props.get("cp_kind") == "manifest" and props.get("cp_snapshot") == snapshot:
+            summary = {"schema": 1, "project": project, "snapshot": snapshot,
+                       "created_at": props.get("cp_created_at"), "reason": props.get("cp_reason"),
+                       "archive_bytes": int(props.get("cp_archive_bytes") or 0),
+                       "archive_sha256": props.get("cp_archive_sha256"),
+                       "file_count": int(props.get("cp_file_count") or 0)}
+        else:
+            manifest = json.loads(drive.read_bytes(item["id"]))
+            if manifest.get("schema") != 1 or manifest.get("snapshot") != snapshot:
+                continue
+            summary = checkpoint_summary(manifest)
+        if any(remote.archive_matches(a, summary) for a in archives.get(snapshot, [])):
+            result.append(summary)
+    return result
 
 
 def prepare(project="default"):
@@ -460,37 +721,148 @@ def upload_source(item, project, script_path, source_directory=None):
     script, source, relative = validate_source(script_path, source_directory)
     limit = config().get("snapshot_limit_bytes", remote.DEFAULT_SNAPSHOT_LIMIT)
     files = remote.inventory(source, limit) if source_directory else {relative.as_posix(): {}}
+    incoming = f"{ENGINE_ROOT}/source-{uuid.uuid4().hex}.tar.gz"
     with tempfile.TemporaryDirectory(prefix="colab-upload-") as temporary:
         archive = Path(temporary) / "source.tar.gz"
         with tarfile.open(archive, "w:gz") as target:
             for name in files:
                 target.add(source / name, arcname=name, recursive=False)
-        incoming = "/content/.colab-persist/source.tar.gz"
         with archive.open("rb") as stream:
             result = subprocess.run([*ssh_command(item), "cat > " + incoming], stdin=stream,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
         if result.returncode:
             raise RuntimeError("Could not upload project source: " + result.stderr.decode(errors="replace")[-1000:])
     workspace = "/content/colab-persist/" + project + "/workspace"
-    code = ("import importlib.util\n"
-            f"s=importlib.util.spec_from_file_location('engine',{REMOTE_ENGINE!r})\n"
-            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
-            f"m.extract_archive(m.Path({incoming!r}),m.Path({workspace!r}),{limit!r})\n")
-    checked([*ssh_command(item), "python3 -"], data=code.encode())
+    code = ("from pathlib import Path\nfrom colab_persist import remote\n"
+            f"try:\n    remote.extract_archive(Path({incoming!r}), Path({workspace!r}), {limit!r})\n"
+            f"finally:\n    Path({incoming!r}).unlink(missing_ok=True)\n")
+    checked([*ssh_command(item), f"cd {ENGINE_ROOT} && python3 -"], data=code.encode())
     return relative.as_posix()
 
 
 def run_script(script_path, project="default", arguments=None, source_directory=None,
-               checkpoint_seconds=60, stop_after=True):
+               checkpoint_seconds=60, stop_after=True, detach=False, log=None):
     validate_run_inputs(script_path, project, source_directory, checkpoint_seconds)
     with operation_lock():
-        item = require_session()
+        item = require_runtime()
         prepared = remote_call("prepare", item=item, project=project)
         entry = upload_source(item, project, script_path, source_directory)
-        result = kernel_call("run", item=item, timeout=86400, project=project, script=entry,
-                             arguments=arguments or [], interval=checkpoint_seconds)
-        # Even a script returning nonzero gets its outputs saved. Saving errors never trigger stop.
-        saved = _save_and_stop(item, stop_after)
-        result["checkpoint"] = checkpoint_summary(result["checkpoint"])
-        result["checkpoint"]["durability"] = "drive_flush_confirmed"
-        return {**result, "restored": prepared["restored"], "save": saved}
+        job = remote_call("launch", item=item, project=project, script=entry, arguments=arguments or [],
+                          interval=checkpoint_seconds, stop_after=stop_after)
+    if job.get("state") == "refused":
+        raise RuntimeError(job.get("error") or "The VM refused the job.")
+    if detach:
+        return {"detached": True, "project": project, "run_id": job.get("run_id"), "state": job.get("state"),
+                "restored": prepared["restored"], "next": f"colab-persist attach --project {project}"}
+    result = monitor(project, item=item, log=log)
+    return {**result, "restored": prepared["restored"]}
+
+
+def job_status(project="default", tail=4000):
+    """One look at a managed job; also refreshes the VM's Drive token."""
+    item = require_runtime()
+    return remote_call("job_status", item=item, project=remote.valid_name(project), tail=tail, timeout=120)
+
+
+def attach(project="default", stop_after=None, log=None):
+    item = require_runtime()
+    current = remote_call("job_status", item=item, project=remote.valid_name(project), tail=4000, timeout=120)
+    if current.get("state") == "none":
+        raise RuntimeError(f"No managed job has run in project {project} on this runtime.")
+    return monitor(project, item=item, stop_after=stop_after, log=log, offset=current.get("offset", 0),
+                   first=current)
+
+
+def monitor(project, *, item, stop_after=None, log=None, offset=0, first=None):
+    """Follow a detached job without holding the local lock; finalize when it ends."""
+    log = log or sys.stderr
+    tail, failures, current = "", 0, first
+    while True:
+        if current is None:
+            try:
+                current = remote_call("job_status", item=item, project=project, offset=offset, timeout=120)
+                failures = 0
+            except RuntimeError as error:
+                failures += 1
+                if failures >= 30:
+                    raise RuntimeError("Lost contact with the runtime while following the job. It may still be "
+                                       f"running; reconnect with `colab-persist attach --project {project}`. "
+                                       + str(error)) from None
+                if runtime_info() is None:
+                    raise RuntimeError("The runtime disappeared during the job. Start a new one and restore the "
+                                       "last verified checkpoint.") from None
+                time.sleep(min(60, 5 * failures))
+                continue
+        if current.get("log"):
+            log.write(current["log"])
+            log.flush()
+            tail = (tail + current["log"])[-8000:]
+        offset = current.get("offset", offset)
+        state = current.get("state")
+        if state in TERMINAL_JOB_STATES:
+            break
+        more = len(current.get("log", "")) >= remote.LOG_CHUNK_BYTES
+        current = None
+        if not more:
+            time.sleep(POLL_SECONDS)
+    if state == "none":
+        raise RuntimeError(f"No managed job found for project {project}.")
+    if state == "refused":
+        raise RuntimeError(current.get("error") or "Another managed job holds this project.")
+    if state == "lost":
+        raise RuntimeError(current.get("error") or "The job worker stopped unexpectedly.")
+    if state == "exited_unsaved":
+        raise RuntimeError("The script exited but its final checkpoint was not saved: "
+                           f"{current.get('error')}. The VM was left running; fix the cause and run "
+                           "`colab-persist stop`.")
+    stop = current.get("stop_after", True) if stop_after is None else stop_after
+    with waiting_lock():
+        saved = _save_and_stop(item, stop)
+    checkpoint = dict(current.get("checkpoint") or {})
+    checkpoint["durability"] = remote.DURABLE
+    return {"exit_code": current.get("exit_code"), "checkpoint": checkpoint, "log_tail": tail,
+            "periodic_checkpoint_errors": current.get("periodic_checkpoint_errors", []), "save": saved}
+
+
+# -- one-time import of v0.3 checkpoints ---------------------------------------------------
+def legacy_mount(cfg, item):
+    """Mount Drive the v0.3 way once, using Google's colab CLI in a temporary environment."""
+    uv = shutil.which("uv")
+    if not uv:
+        raise RuntimeError("The one-time import needs `uv` (https://docs.astral.sh/uv/).")
+    runtime = api_for(cfg).get_runtime(colab_api.runtime_id_of(item))
+    if runtime is None:
+        raise RuntimeError("The managed runtime disappeared.")
+    info = runtime["connectionInfo"]
+    directory = accounts.account_dir(CONFIG_DIR, cfg["expected_email"])
+    env = os.environ.copy()
+    env["GOOGLE_APPLICATION_CREDENTIALS"] = str(accounts.credentials_path(cfg))
+    with tempfile.TemporaryDirectory(prefix="legacy-", dir=directory) as temporary:
+        arguments = Path(temporary) / "mount.json"
+        descriptor = os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump({"config_path": str(Path(temporary) / "sessions.json"), "name": cfg.get("session", "cuda"),
+                       "url": info["url"], "token": info["token"], "expires_at": info.get("expireTime"),
+                       "endpoint": colab_api.endpoint_from_url(info["url"])}, handle)
+        command = [uv, "run", "--no-project", "--quiet", "--with", LEGACY_CLI, "python",
+                   str(Path(__file__).with_name("legacy_mount.py")), str(arguments)]
+        for attempt in range(3):
+            subprocess.run(command, env=env)
+            if remote_call("status", item=item).get("drive_mounted"):
+                return True
+            if attempt < 2:
+                print("Drive did not finish mounting. A 'ValueError: mount failed' just after consent is Colab's "
+                      "first mount racing the new credentials. Retrying in 5 s.", file=sys.stderr)
+                time.sleep(5)
+    raise RuntimeError("The legacy Drive mount did not complete. Run `colab-persist import-legacy` again.")
+
+
+def import_legacy(projects=None, all_snapshots=False, legacy_folder=None):
+    with operation_lock():
+        cfg = config()
+        item = require_runtime()
+        if not remote_call("status", item=item).get("drive_mounted"):
+            legacy_mount(cfg, item)
+        return remote_call("import_legacy", item=item, timeout=6 * 3600,
+                           legacy_folder=legacy_folder or cfg["legacy_drive_folder"],
+                           projects=list(projects) if projects else None, all_snapshots=bool(all_snapshots))

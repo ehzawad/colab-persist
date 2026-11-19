@@ -1,3 +1,4 @@
+"""Local input errors are rejected before any runtime is allocated or contacted."""
 import contextlib
 import io
 from pathlib import Path
@@ -23,15 +24,15 @@ class RunPreflightTests(unittest.TestCase):
     def assert_cli_rejected_without_runtime(self, arguments):
         with patch.object(client.sys, "argv", ["colab-persist", "run", *arguments]), \
                 patch.object(client, "invoke") as invoke, \
-                patch.object(backend, "mount_drive") as mount, \
-                patch.object(backend, "identity") as identity, \
+                patch.object(backend, "require_runtime") as runtime, \
+                patch.object(backend, "start_runtime") as start, \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as stopped:
                 client.main()
             self.assertEqual(stopped.exception.code, 1)
         invoke.assert_not_called()
-        mount.assert_not_called()
-        identity.assert_not_called()
+        runtime.assert_not_called()
+        start.assert_not_called()
 
     def test_missing_or_non_python_script_never_allocates(self):
         text = self.root / "notes.txt"
@@ -69,6 +70,13 @@ class RunPreflightTests(unittest.TestCase):
         script.write_text("pass\n")
         self.assert_cli_rejected_without_runtime([str(script), "--source", str(self.root)])
 
+    def test_unknown_gpu_is_rejected_before_any_tool_call(self):
+        with patch.object(client.sys, "argv", ["colab-persist", "start", "--gpu", "TPU"]), \
+                patch.object(client, "invoke") as invoke, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                client.main()
+        invoke.assert_not_called()
+
     def test_metadata_check_skips_exclusions_links_and_special_files(self):
         cache = self.root / ".venv"
         cache.mkdir()
@@ -99,30 +107,36 @@ class RunPreflightTests(unittest.TestCase):
         def invoke(name, **arguments):
             calls.append((name, arguments))
             if name == "start_runtime":
-                return {"session": "test", "gpu": "L4"}
+                return {"session": "test", "runtime": "cp-test-abc123", "gpu": "L4", "drive_connected": True}
             return {"exit_code": 0}
 
         arguments = ["colab-persist", "run", str(self.script), "--source", str(self.root),
-                     "--project", "new-project", "--checkpoint-seconds", "10", "--", "--steps", "2"]
+                     "--project", "new-project", "--checkpoint-seconds", "10", "--gpu", "T4", "--high-mem",
+                     "--", "--steps", "2"]
         with patch.object(client.sys, "argv", arguments), \
                 patch.object(client, "invoke", side_effect=invoke), \
                 patch.object(backend, "mount_drive") as mount, \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             client.main()
-        mount.assert_called_once_with()
+        mount.assert_not_called()  # Drive connects through the API; no browser mount step.
         self.assertEqual([name for name, _ in calls], ["start_runtime", "run_script"])
+        self.assertEqual(calls[0][1], {"gpu": "T4", "tpu": None, "cpu": False, "high_mem": True})
         self.assertEqual(calls[1][1]["arguments"], ["--steps", "2"])
         self.assertEqual(calls[1][1]["checkpoint_seconds"], 10)
         self.assertEqual(calls[1][1]["project"], "new-project")
+        self.assertEqual(calls[1][1]["source_directory"], str(self.root))
+        self.assertTrue(calls[1][1]["stop_after"])
+        self.assertFalse(calls[1][1]["detach"])
 
     def test_mcp_backend_rejects_invalid_input_before_lock_or_connection(self):
         cases = [dict(script_path=self.root / "missing.py"),
                  dict(script_path=self.script, project="../escape"),
-                 dict(script_path=self.script, checkpoint_seconds=9)]
+                 dict(script_path=self.script, checkpoint_seconds=9),
+                 dict(script_path=self.script, checkpoint_seconds=10.5)]
         for arguments in cases:
             with self.subTest(arguments=arguments), \
                     patch.object(backend, "operation_lock") as lock, \
-                    patch.object(backend, "require_session") as connection:
+                    patch.object(backend, "require_runtime") as connection:
                 with self.assertRaises((ValueError, OSError)):
                     backend.run_script(**arguments)
                 lock.assert_not_called()

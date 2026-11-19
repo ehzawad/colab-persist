@@ -8,7 +8,7 @@ pipeline.** No terabyte transfer or Qwen training benchmark has been performed.
 
 | Files | Location | Recovery |
 |---|---|---|
-| Immutable corpus shards | Drive `Colab-CUDA/datasets/<name>/<version>/` | Read again from Drive as needed |
+| Immutable corpus shards | Drive `Colab-Persist/datasets/<name>/<version>/` | Read again from Drive as needed |
 | Disposable dataset working set | VM `/content/colab-persist-cache/datasets/` | Rebuild from the manifest; never included in workspace archives |
 | Base model/download cache | VM `/content/colab-persist-cache/huggingface/` | Download the pinned model revision again |
 | Source, manifest, small training checkpoints | Managed project `workspace/` | Existing Drive workspace snapshots |
@@ -19,8 +19,8 @@ The reserve must also accommodate model downloads, temporary files, activations
 offloaded to disk and checkpoint archives. Other processes can consume disk; the
 cache checks space before and during each copy, but cannot reserve it system-wide.
 
-Google recommends avoiding many small reads from mounted Drive and using local
-VM storage for active data. More Drive capacity does not enlarge VM disk. See the
+Shards are read through the Drive API into local VM storage; training reads the
+local copy. More Drive capacity does not enlarge VM disk. See the
 [Colab FAQ](https://research.google.com/colaboratory/faq.html).
 
 ## Prepare immutable shards once
@@ -31,7 +31,7 @@ can read in bounded batches. A single 1 TB archive cannot fit in a 40 GiB cache.
 Partition very large file counts into subdirectories. Do not rewrite a shard
 under an existing version; publish a new version and manifest.
 
-Manifest paths are relative to `Colab-CUDA/datasets/`, **not the manifest file**:
+Manifest paths are relative to `Colab-Persist/datasets/`, **not the manifest file**:
 
 ```json
 {
@@ -62,6 +62,26 @@ fingerprint. It rejects malformed manifests, unsafe paths, duplicate paths and a
 shard larger than the cache. It does not allocate a GPU or verify Drive files,
 Drive capacity, current VM free space, bandwidth or model memory requirements.
 
+## Put shards into Drive from the VM
+
+colab-persist uses the `drive.file` permission, so it can read only files that
+colab-persist itself created. Upload shards with the bundled helper rather than
+through the Drive website. Download or generate the data on the VM (Colab's network,
+not your Mac's), then publish each finished shard:
+
+```sh
+colab-persist ssh -- python3 -m colab_persist.drive_api put \
+  /content/staging/part-00000.parquet datasets/agent-trajectories/v1/part-00000.parquet
+colab-persist ssh -- python3 -m colab_persist.drive_api ls datasets/agent-trajectories/v1
+```
+
+`put` creates the folders, uses a resumable upload, checks Drive's reported size and
+SHA-256, prints them, and refuses to overwrite an existing file. Record the size and
+SHA-256 in your manifest as you go. Scripts can do the same with
+`colab_persist.drive_api.DriveClient(TokenSource.from_environment())`. Drive accepts
+up to 750 GB of uploads per account per day; a 1 TB corpus takes at least two days
+to publish.
+
 ## Read a bounded working set on the VM
 
 Managed scripts and new SSH login shells can import `colab_persist.datasets`.
@@ -75,7 +95,7 @@ from colab_persist.datasets import ShardCache, load_manifest, plan
 manifest = load_manifest("corpus.json")
 cache = ShardCache(
     manifest,
-    dataset_root=os.environ.get("COLAB_DATASET_ROOT", "/content/drive/MyDrive/Colab-CUDA/datasets"),
+    dataset_root=os.environ.get("COLAB_DATASET_ROOT", "gdrive://Colab-Persist/datasets"),
     cache_root=os.environ.get("COLAB_DATASET_CACHE", "/content/colab-persist-cache/datasets"),
     cache_bytes=40 * 1024**3,
     reserve_bytes=20 * 1024**3,
@@ -97,9 +117,11 @@ explicitly with the format. Batching is still the reader's responsibility.
 
 Copies are sequential and on demand. A copy goes to `.partial`, is checked against
 the manifest's size and SHA-256, and becomes visible only after successful
-verification. Interrupted copies restart from the beginning of that shard. This
-release does not implement range resume, asynchronous prefetch, automatic retries
-for Drive quota failures or sharding an existing large file.
+verification. A dropped download connection resumes with a ranged request; a copy
+interrupted by a crash restarts from the beginning of that shard. A `gdrive://`
+root reads through the VM's short-lived Drive token; a local directory root still
+works as before. This release does not implement asynchronous prefetch, automatic
+retries for Drive quota failures or sharding an existing large file.
 
 Least-recently-used cached blobs are evicted when space is needed. Active leases
 are protected with process locks. All manifests sharing one cache root share the
@@ -159,11 +181,12 @@ loader that saves the full required state. See [streaming state](https://hugging
 Online agent rollouts also need task/rollout IDs and explicit handling of partial
 episodes and external tool side effects; a filesystem snapshot cannot recreate them.
 
-Periodic snapshots through the native Drive mount remain `pending_drive_flush`.
-Only the final flush-and-unmount is acknowledged by this tool. Unexpected VM loss
-can lose recent writes. This release does not promise a maximum loss interval or
-exact recovery after forced termination; direct acknowledged cloud uploads remain
-future work.
+Every workspace snapshot, periodic ones included, is a direct upload that Drive
+acknowledges with its size and SHA-256 (`drive_upload_verified`). Unexpected VM loss
+can still lose everything written after the last verified snapshot, so the
+checkpoint interval bounds the loss only while snapshots succeed: a snapshot can be
+skipped while your computer is away and the VM's Drive token has expired, or while
+a file keeps changing. Check `colab-persist job` for the last checkpoint time.
 
 ## Qwen3.5-9B on an L4
 

@@ -1,6 +1,8 @@
 """Read-only Drive shards in a bounded local cache (stdlib only).
 
 The manifest paths are relative to the dataset root, not to the manifest file.
+The root is either ``gdrive://<folder>/datasets`` (read through the Drive API with
+the VM's short-lived token; the default inside managed runs) or a local directory.
 Hold ``cache.lease(shard)`` open for the entire time a reader uses its file.
 Transfers are serialized across cache instances. Interrupted copies restart;
 only verified, atomically published blobs can be leased. This module never
@@ -20,7 +22,9 @@ import shutil
 import stat
 from typing import Mapping
 
-DEFAULT_DATASET_ROOT = "/content/drive/MyDrive/Colab-CUDA/datasets"
+DEFAULT_DATASET_ROOT = "gdrive://Colab-Persist/datasets"
+LEGACY_DATASET_ROOT = "/content/drive/MyDrive/Colab-CUDA/datasets"
+DRIVE_SCHEME = "gdrive://"
 DEFAULT_CACHE_ROOT = "/content/colab-persist-cache/datasets"
 DEFAULT_CACHE_BYTES = 40 * 1024**3
 DEFAULT_RESERVE_BYTES = 20 * 1024**3
@@ -191,17 +195,24 @@ class ShardCache:
     read-only and verified locally on every lease. Readers must not modify them.
     """
 
-    def __init__(self, manifest, *, dataset_root=DEFAULT_DATASET_ROOT,
+    def __init__(self, manifest, *, dataset_root=None,
                  cache_root=DEFAULT_CACHE_ROOT, cache_bytes=DEFAULT_CACHE_BYTES,
-                 reserve_bytes=DEFAULT_RESERVE_BYTES):
+                 reserve_bytes=DEFAULT_RESERVE_BYTES, drive=None):
         self.manifest = load_manifest(manifest)
         plan(self.manifest, cache_bytes, reserve_bytes)
         self.cache_bytes, self.reserve_bytes = cache_bytes, reserve_bytes
-        self.dataset_root = Path(dataset_root)
-        source_location = self.dataset_root.resolve()
-        cache_location = Path(cache_root).resolve()
-        if source_location.is_relative_to(cache_location) or cache_location.is_relative_to(source_location):
-            raise ValueError("Dataset source and disposable cache must be separate, non-overlapping directories.")
+        dataset_root = str(dataset_root or os.environ.get("COLAB_DATASET_ROOT") or DEFAULT_DATASET_ROOT)
+        self._drive, self._drive_parts, self._folders = drive, None, {}
+        if dataset_root.startswith(DRIVE_SCHEME):
+            from . import drive_api
+            self._drive_parts = drive_api.relative_parts(dataset_root[len(DRIVE_SCHEME):].strip("/"))
+            self.dataset_root = dataset_root
+        else:
+            self.dataset_root = Path(dataset_root)
+            source_location = self.dataset_root.resolve()
+            cache_location = Path(cache_root).resolve()
+            if source_location.is_relative_to(cache_location) or cache_location.is_relative_to(source_location):
+                raise ValueError("Dataset source and disposable cache must be separate, non-overlapping directories.")
         self.root = _directory(cache_root, create=True)
         self.blobs = _directory(self.root / "blobs", create=True)
         self.locks = _directory(self.root / "locks", create=True)
@@ -301,7 +312,63 @@ class ShardCache:
             if sha.hexdigest() != shard.sha256 or _identity(before) != _identity(os.fstat(handle.fileno())):
                 raise RuntimeError("Cached shard checksum failed; cache contents were modified.")
 
+    def _drive_client(self):
+        if self._drive is None:
+            from . import drive_api
+            self._drive = drive_api.DriveClient(drive_api.TokenSource.from_environment())
+        return self._drive
+
+    def _drive_file(self, shard):
+        drive = self._drive_client()
+        parts = self._drive_parts + shard.path.split("/")
+        key = "/".join(parts[:-1])
+        if key not in self._folders:
+            self._folders[key] = drive.resolve(parts[:-1])
+        parent = self._folders[key]
+        matches = drive.children(parent, name=parts[-1], folders=False) if parent else []
+        if len(matches) != 1:
+            raise RuntimeError(f"Expected exactly one Drive file for shard {shard.path}; found {len(matches)}.")
+        item = matches[0]
+        if int(item.get("size", -1)) != shard.size:
+            raise RuntimeError(f"Source shard size differs from manifest: {shard.path}")
+        if item.get("sha256Checksum") and item["sha256Checksum"] != shard.sha256:
+            raise RuntimeError(f"Source shard checksum differs from manifest: {shard.path}")
+        return drive, item
+
+    def _copy_from_drive(self, shard, destination):
+        partial = destination.with_name(destination.name + ".partial")
+        try:
+            drive, item = self._drive_file(shard)
+            os.close(_regular_open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+
+            def reserve(block):
+                # Other processes may consume space while a transfer runs.
+                if shutil.disk_usage(self.root).free < block + self.reserve_bytes:
+                    raise RuntimeError("Insufficient local disk to retain the configured reserve.")
+            try:
+                drive.download(item["id"], partial, expected_size=shard.size, expected_sha256=shard.sha256,
+                               reserve_check=reserve)
+            except Exception as error:
+                if "SHA-256" in str(error):
+                    raise RuntimeError(f"Source shard checksum differs from manifest: {shard.path}") from None
+                raise
+            self._publish(partial, destination)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+
+    def _publish(self, partial, destination):
+        partial.chmod(0o444)
+        partial.replace(destination)
+        directory = os.open(self.blobs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def _copy(self, shard, destination):
+        if self._drive_parts is not None:
+            return self._copy_from_drive(shard, destination)
         partial = destination.with_name(destination.name + ".partial")
         try:
             with _source_file(self.dataset_root, shard.path) as source:
@@ -325,13 +392,7 @@ class ShardCache:
                     raise RuntimeError("Source shard changed during transfer.")
                 if copied != shard.size or sha.hexdigest() != shard.sha256:
                     raise RuntimeError(f"Source shard checksum differs from manifest: {shard.path}")
-            partial.chmod(0o444)
-            partial.replace(destination)
-            directory = os.open(self.blobs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            self._publish(partial, destination)
         except BaseException:
             # SIGKILL can leave a partial; the next transfer discards it safely.
             partial.unlink(missing_ok=True)
