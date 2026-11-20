@@ -28,6 +28,9 @@ import urllib.error
 
 from colab_persist import drive_api
 
+# Offline tests never start the real background Drive helper; its own tests opt back in.
+os.environ["COLAB_PERSIST_NO_KEEPER"] = "1"
+
 FOLDER = drive_api.FOLDER_MIME
 EMAIL = "first@example.com"
 QUOTA_PROJECT = "demo-quota-project"

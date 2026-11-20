@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import random
 import re
 import shutil
 import signal
@@ -85,9 +87,13 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def inventory(root: Path, max_bytes: int | None = None) -> dict:
-    """Only regular files inside the workspace; never follow symbolic links."""
-    result, candidates, total = {}, [], 0
+def listed_files(root: Path, max_bytes: int | None = None) -> list:
+    """Workspace-relative names of the regular files inventory would hash, without hashing."""
+    return [relative.as_posix() for _, relative, _ in _candidates(root, max_bytes)]
+
+
+def _candidates(root: Path, max_bytes: int | None):
+    candidates, total = [], 0
     for directory, names, files in os.walk(root, followlinks=False):
         names[:] = sorted(n for n in names if not excluded(Path(directory, n).relative_to(root))
                           and not Path(directory, n).is_symlink())
@@ -96,7 +102,10 @@ def inventory(root: Path, max_bytes: int | None = None) -> dict:
             relative = path.relative_to(root)
             if excluded(relative) or path.is_symlink():
                 continue
-            before = path.stat()
+            try:
+                before = path.stat()
+            except FileNotFoundError:
+                continue  # A temporary file removed while listing.
             if not stat.S_ISREG(before.st_mode):
                 continue
             total += before.st_size
@@ -104,16 +113,93 @@ def inventory(root: Path, max_bytes: int | None = None) -> dict:
                 raise RuntimeError("Workspace/source exceeds the snapshot size limit. Keep datasets and base "
                                    "model caches outside the workspace; use the bounded dataset cache.")
             candidates.append((path, relative, before))
+    return candidates
+
+
+def inventory(root: Path, max_bytes: int | None = None) -> dict:
+    """Only regular files inside the workspace; never follow symbolic links."""
+    result = {}
     # Complete the metadata size check before hashing even the first large file.
-    for path, relative, before in candidates:
-        sha = digest(path)
-        after = path.stat()
+    for path, relative, _ in _candidates(root, max_bytes):
+        try:
+            before = path.stat()  # Per file, so a busy log never fails because a big file hashed first.
+            sha = digest(path)
+            after = path.stat()
+        except FileNotFoundError:
+            raise RuntimeError(f"File changed during checkpoint: {relative}. Retry after its writer finishes.") \
+                from None
         if (before.st_size, before.st_mtime_ns, before.st_ino) != (
                 after.st_size, after.st_mtime_ns, after.st_ino):
             raise RuntimeError(f"File changed during checkpoint: {relative}. Retry after its writer finishes.")
         result[relative.as_posix()] = {"size": before.st_size, "sha256": sha,
                                        "mode": stat.S_IMODE(before.st_mode)}
     return result
+
+
+class _ChangedWhileRead(Exception):
+    pass
+
+
+class _HashingReader:
+    def __init__(self, stream):
+        self.stream, self.hash = stream, hashlib.sha256()
+
+    def read(self, size=-1):
+        data = self.stream.read(size)
+        self.hash.update(data)
+        return data
+
+
+def _archive_once(target: tarfile.TarFile, workspace: Path, names, max_bytes: int | None) -> dict:
+    files, total = {}, 0
+    for name in names:
+        try:
+            descriptor = os.open(workspace / name, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            continue  # Deleted since it was listed; the manifest describes what is archived.
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                continue  # Became a symbolic link; links are never archived.
+            raise
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                continue
+            total += before.st_size
+            if max_bytes is not None and total > max_bytes:
+                raise RuntimeError("Workspace/source exceeds the snapshot size limit. Keep datasets and base "
+                                   "model caches outside the workspace; use the bounded dataset cache.")
+            info = target.gettarinfo(arcname=name, fileobj=stream)
+            info.type, info.linkname, info.size = tarfile.REGTYPE, "", before.st_size  # Hard links as files.
+            reader = _HashingReader(stream)
+            try:
+                target.addfile(info, reader)
+            except OSError:
+                raise _ChangedWhileRead(name) from None  # It shrank while being read.
+            after = os.fstat(stream.fileno())
+            if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+                raise _ChangedWhileRead(name)
+        files[name] = {"size": before.st_size, "sha256": reader.hash.hexdigest(),
+                       "mode": stat.S_IMODE(before.st_mode)}
+    return files
+
+
+def archive_workspace(workspace: Path, names, archive: Path, max_bytes: int | None = None, attempts: int = 8) -> dict:
+    """Archive the listed regular files and return manifest entries hashed from the exact bytes archived.
+
+    Each file is read through one open descriptor, so a file replaced atomically while
+    the checkpoint runs is archived whole. A file modified in place during its own read
+    restarts the archive after a short random pause; it is never archived torn."""
+    for attempt in range(attempts):
+        try:
+            with tarfile.open(archive, "w:gz", compresslevel=1) as target:
+                return _archive_once(target, workspace, names, max_bytes)
+        except _ChangedWhileRead as changed:
+            if attempt == attempts - 1:
+                raise RuntimeError(f"File changed during checkpoint: {changed}. Retry after its writer "
+                                   "finishes.") from None
+            time.sleep(random.uniform(0.05, 0.5))
+    raise AssertionError("unreachable")
 
 
 def extract_archive(archive: Path, target: Path, max_bytes: int | None = None) -> None:
@@ -370,14 +456,19 @@ class Store:
         workspace = self.workspace(project)
         if not workspace.is_dir():
             raise RuntimeError(f"Workspace {project} has not been prepared.")
-        files = inventory(workspace, self.snapshot_limit)
         try:
-            previous = self.latest(project)
+            previous = self.latest(project)  # Network first, so it never widens the window for live writers.
         except drive_api.DriveError:
             raise
         except (RuntimeError, ValueError):
             previous = None  # A broken newest pair is never reused; a fresh checkpoint supersedes it.
-        if previous and previous["manifest"]["files"] == files:
+        try:
+            files = inventory(workspace, self.snapshot_limit)
+        except RuntimeError as error:
+            if "changed during checkpoint" not in str(error):
+                raise
+            files = None  # A live writer: nothing to reuse; the archive pass reads each file consistently.
+        if previous and files is not None and previous["manifest"]["files"] == files:
             # Reuse only a pair that is verifiably intact right now: both files fetched by ID.
             archive_now = self.drive.get(previous["archive"]["id"])
             manifest_id = previous["entry"]["manifest"]["id"]
@@ -391,14 +482,15 @@ class Store:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         identifier = stamp + "-" + uuid.uuid4().hex[:8]
         # gzip can grow incompressible input; allow headers plus a free-disk reserve.
-        required = int(sum(f["size"] for f in files.values()) * 1.02) + len(files) * 4096
+        names = list(files) if files is not None else listed_files(workspace, self.snapshot_limit)
+        listed_bytes = sum(f["size"] for f in files.values()) if files is not None else sum(
+            (workspace / n).stat().st_size for n in names if (workspace / n).exists())
+        required = int(listed_bytes * 1.02) + len(names) * 4096
         if shutil.disk_usage(self.scratch).free < required + DEFAULT_DISK_RESERVE:
             raise RuntimeError("Insufficient scratch disk for a workspace archive and the 2 GiB reserve.")
         with tempfile.TemporaryDirectory(prefix="checkpoint-", dir=self.scratch) as temporary:
             archive = Path(temporary) / (identifier + ".tar.gz")
-            with tarfile.open(archive, "w:gz", compresslevel=1) as target:
-                for name in files:
-                    add_regular(target, workspace / name, name)
+            files = archive_workspace(workspace, names, archive, self.snapshot_limit)
             # Validate what was actually archived; a live writer cannot silently produce a good manifest.
             with tarfile.open(archive, "r:gz") as source:
                 for member in source.getmembers():
@@ -729,7 +821,7 @@ class Store:
                         except Exception as error:
                             # A file rewritten mid-archive is retried shortly; it is never saved torn.
                             if "changed during" in str(error) and attempt < 2 and process.poll() is None:
-                                time.sleep(1)
+                                time.sleep(random.uniform(0.2, 1.5))  # Never in step with a 1 Hz writer.
                                 continue
                             failures.append(str(error))
                             self._write_job(project, last_error=str(error)[:500],

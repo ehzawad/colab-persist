@@ -290,11 +290,16 @@ While a job runs, `status`, `sessions`, `ssh` and `job` work normally. `save`,
 `stop` and `restore` refuse until the job ends, so a job is never saved half-written.
 A file rewritten during a checkpoint is retried shortly and never archived torn.
 
-The VM's Drive token lasts about an hour and is renewed whenever your computer
-talks to the VM. If your computer is away longer, the job keeps running; periodic
-checkpoints pause, and when the script exits the job waits up to 24 hours for you
-to reconnect (`attach`, `job`, `status` or `mount`) before it finishes saving.
-The VM is never stopped with unsaved results. Google can still reclaim a VM at any
+The VM's Drive token lasts about an hour and is renewed only from your computer.
+While a job runs, a small helper on your computer renews it every 10 minutes, so
+checkpoints keep saving for as long as your computer is awake and online, even with
+no terminal open. It starts with `run` (and `attach`, `job` or `status` restart it,
+for example after a reboot), exits by itself once no job is running, and logs to
+`~/.config/colab-persist/keeper.log`; set
+`COLAB_PERSIST_NO_KEEPER=1` to turn it off. While your computer sleeps or is
+offline, the job keeps running but periodic checkpoints pause; they resume within
+a minute of waking. If the script exits meanwhile, the job waits up to 24 hours for
+your computer before it finishes saving. The VM is never stopped with unsaved results. Google can still reclaim a VM at any
 time; the last verified checkpoint is then your recovery point.
 
 ## Checkpoints and shutdown

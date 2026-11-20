@@ -1,6 +1,6 @@
 [project]
 name = "colab-persist"
-version = "0.4.0"
+version = "0.4.1"
 description = "Verified Google Drive checkpoints for disposable Colab runtimes on the official Colab API, with a local MCP server and client"
 readme = "README.md"
 license = "MIT"

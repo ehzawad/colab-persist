@@ -129,7 +129,12 @@ class CheckpointTests(StoreCase):
             hashing.assert_not_called()
         self.assertEqual(self.drive.upload_names(), [])
 
-    def test_file_changed_while_hashing_is_refused(self):
+    def restored_text(self, name):
+        replacement = self.replacement(f"vm-{len(list(self.base.iterdir()))}")
+        replacement.prepare("demo")
+        return (replacement.workspace("demo") / name).read_text()
+
+    def test_a_file_rewritten_while_hashing_is_archived_whole(self):
         (self.workspace / "data").write_text("stable")
         real = remote.digest
 
@@ -138,9 +143,103 @@ class CheckpointTests(StoreCase):
                 path.write_text("changed by a live writer")
             return real(path)
         with patch.object(remote, "digest", side_effect=changing):
-            with self.assertRaisesRegex(RuntimeError, "File changed during checkpoint"):
+            saved = self.store.snapshot("demo")
+        self.assertEqual(saved["files"]["data"]["sha256"], hashlib.sha256(b"changed by a live writer").hexdigest())
+        self.assertEqual(self.restored_text("data"), "changed by a live writer")
+
+
+class LiveWriterTests(StoreCase):
+    """Found live: a script that rewrites its progress file every second failed most periodic saves."""
+
+    def setUp(self):
+        super().setUp()
+        self.start = patch.object(remote.time, "sleep")
+        self.sleep = self.start.start()
+        self.addCleanup(self.start.stop)
+
+    def restored_text(self, name):
+        replacement = self.replacement("vm-restore")
+        replacement.prepare("demo")
+        return (replacement.workspace("demo") / name).read_text()
+
+    def test_a_file_replaced_atomically_during_the_save_is_archived_whole(self):
+        progress = self.workspace / "outputs" / "progress.json"
+        progress.write_text('{"completed": 1}')
+        real = remote.inventory
+
+        def then_replace(*args, **kwargs):
+            listed = real(*args, **kwargs)
+            temporary = progress.with_suffix(".tmp")
+            temporary.write_text('{"completed": 2}')
+            os.replace(temporary, progress)  # How training scripts publish a checkpoint.
+            return listed
+        with patch.object(remote, "inventory", side_effect=then_replace):
+            saved = self.store.snapshot("demo")
+        self.assertEqual(saved["files"]["outputs/progress.json"]["sha256"],
+                         hashlib.sha256(b'{"completed": 2}').hexdigest())
+        self.assertEqual(self.restored_text("outputs/progress.json"), '{"completed": 2}')
+
+    def test_a_file_appended_while_it_is_read_is_retried_and_never_torn(self):
+        log = self.workspace / "outputs" / "run.log"
+        log.write_text("step 1\n")
+        real_read = remote._HashingReader.read
+        appended = []
+
+        def read(reader, size=-1):
+            data = real_read(reader, size)
+            if not appended and data:
+                appended.append(True)
+                with log.open("a") as stream:
+                    stream.write("step 2\n")
+            return data
+        with patch.object(remote._HashingReader, "read", read):
+            saved = self.store.snapshot("demo")
+        self.assertEqual(self.sleep.call_count, 1)  # One short, random pause before the retry.
+        self.assertEqual(saved["files"]["outputs/run.log"]["sha256"], hashlib.sha256(b"step 1\nstep 2\n").hexdigest())
+        self.assertEqual(self.restored_text("outputs/run.log"), "step 1\nstep 2\n")
+
+    def test_a_file_that_never_stops_changing_is_refused_not_archived_torn(self):
+        log = self.workspace / "outputs" / "run.log"
+        log.write_text("step 1\n")
+        real_read = remote._HashingReader.read
+
+        def read(reader, size=-1):
+            data = real_read(reader, size)
+            if data:
+                with log.open("a") as stream:
+                    stream.write("more\n")
+            return data
+        with patch.object(remote._HashingReader, "read", read):
+            with self.assertRaisesRegex(RuntimeError, "File changed during checkpoint: outputs/run.log"):
                 self.store.snapshot("demo")
         self.assertEqual(self.drive.upload_names(), [])
+
+    def test_a_busy_log_never_fails_because_a_large_file_was_hashed_first(self):
+        (self.workspace / "big.bin").write_bytes(b"x" * 1000)
+        log = self.workspace / "outputs" / "run.log"
+        log.write_text("step 1\n")
+        real = remote.digest
+
+        def hashing(path):
+            if path.name == "big.bin":
+                with log.open("a") as stream:
+                    stream.write("step 2\n")  # Written while the big file hashes.
+            return real(path)
+        with patch.object(remote, "digest", side_effect=hashing):
+            listed = remote.inventory(self.workspace)
+        self.assertEqual(listed["outputs/run.log"]["size"], len("step 1\nstep 2\n"))
+
+    def test_a_temporary_file_removed_while_listing_is_skipped(self):
+        (self.workspace / "data").write_text("kept")
+        real_walk = os.walk
+
+        def walk(root, **kwargs):
+            for directory, names, files in real_walk(root, **kwargs):
+                yield directory, names, files + (["gone.lock"] if Path(directory) == self.workspace else [])
+        with patch.object(remote.os, "walk", walk):
+            listed = remote.listed_files(self.workspace)
+        self.assertIn("data", listed)
+        self.assertNotIn("gone.lock", listed)
 
     def test_snapshot_preserves_previous_generation_when_disk_is_full(self):
         first = self.store.snapshot("demo")

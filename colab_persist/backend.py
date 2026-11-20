@@ -32,6 +32,7 @@ LEGACY_CLI = "google-colab-cli==0.7.4"
 POLL_SECONDS = 10
 TOKEN_MARGIN_SECONDS = 15 * 60
 TERMINAL_JOB_STATES = {"finished", "exited_unsaved", "refused", "none", "lost"}
+KEEPER_LOCK, KEEPER_LOG, KEEPER_WANTED = "keeper.lock", "keeper.log", "keeper.wanted"
 _TOKENS: dict = {}
 
 
@@ -460,6 +461,30 @@ def token_refresher(item, every_seconds=1800):
         stop.set()
 
 
+def ensure_keeper():
+    """Start the background helper that keeps a running job's Drive access fresh.
+
+    One helper per computer; it exits when no managed job is active. Set
+    COLAB_PERSIST_NO_KEEPER=1 to turn it off. Never fails the calling command."""
+    if os.environ.get("COLAB_PERSIST_NO_KEEPER"):
+        return False
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (CONFIG_DIR / KEEPER_WANTED).touch()  # A helper about to exit stays for this job.
+        with open(CONFIG_DIR / KEEPER_LOCK, "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True  # Already running.
+        with open(CONFIG_DIR / KEEPER_LOG, "ab") as output:
+            subprocess.Popen([sys.executable, "-m", "colab_persist.keeper"], cwd=str(CONFIG_DIR),
+                             stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                             start_new_session=True, close_fds=True)
+        return True
+    except OSError:
+        return False
+
+
 def parse_result(raw, operation=None):
     results = [line[len(remote.RESULT_PREFIX):] for line in raw.splitlines()
                if line.startswith(remote.RESULT_PREFIX)]
@@ -610,10 +635,12 @@ def status():
         if runtime is None:
             return {**summary, "active": False, "pending_creation": bool(pending),
                     "next": "colab-persist start" if not everything or pending else "colab-persist sessions"}
-        return {**summary, "active": True, "session": cfg.get("session", "cuda"),
-                "runtime": colab_api.runtime_id_of(runtime),
-                "gpu": colab_api.spec_label(runtime.get("runtimeSpec", {})),
-                **remote_call("status", item=runtime)}
+        vm = remote_call("status", item=runtime)
+    if any(item.get("active") for item in (vm.get("workspaces") or {}).values()):
+        ensure_keeper()  # Restarts the helper after a reboot, for example.
+    return {**summary, "active": True, "session": cfg.get("session", "cuda"),
+            "runtime": colab_api.runtime_id_of(runtime),
+            "gpu": colab_api.spec_label(runtime.get("runtimeSpec", {})), **vm}
 
 
 def mount_drive():
@@ -837,6 +864,7 @@ def run_script(script_path, project="default", arguments=None, source_directory=
                           interval=checkpoint_seconds, stop_after=stop_after)
     if job.get("state") == "refused":
         raise RuntimeError(job.get("error") or "The VM refused the job.")
+    ensure_keeper()
     if detach:
         return {"detached": True, "project": project, "run_id": job.get("run_id"), "state": job.get("state"),
                 "restored": prepared["restored"], "next": f"colab-persist attach --project {project}"}
@@ -847,7 +875,10 @@ def run_script(script_path, project="default", arguments=None, source_directory=
 def job_status(project="default", tail=4000):
     """One look at a managed job; also refreshes the VM's Drive token."""
     item = require_runtime()
-    return remote_call("job_status", item=item, project=remote.valid_name(project), tail=tail, timeout=120)
+    result = remote_call("job_status", item=item, project=remote.valid_name(project), tail=tail, timeout=120)
+    if result.get("state") not in TERMINAL_JOB_STATES:
+        ensure_keeper()
+    return result
 
 
 def attach(project="default", stop_after=None, log=None):
@@ -855,6 +886,8 @@ def attach(project="default", stop_after=None, log=None):
     current = remote_call("job_status", item=item, project=remote.valid_name(project), tail=4000, timeout=120)
     if current.get("state") == "none":
         raise RuntimeError(f"No managed job has run in project {project} on this runtime.")
+    if current.get("state") not in TERMINAL_JOB_STATES:
+        ensure_keeper()  # Keeps saving if this follow is interrupted.
     return monitor(project, item=item, stop_after=stop_after, log=log, offset=current.get("offset", 0),
                    first=current, run_id=current.get("run_id"))
 
