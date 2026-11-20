@@ -840,7 +840,7 @@ def run_script(script_path, project="default", arguments=None, source_directory=
     if detach:
         return {"detached": True, "project": project, "run_id": job.get("run_id"), "state": job.get("state"),
                 "restored": prepared["restored"], "next": f"colab-persist attach --project {project}"}
-    result = monitor(project, item=item, log=log, run_id=job.get("run_id"))
+    result = monitor(project, item=item, log=log, offset=job.get("log_start", 0), run_id=job.get("run_id"))
     return {**result, "restored": prepared["restored"]}
 
 

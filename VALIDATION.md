@@ -40,6 +40,9 @@ Drive directly with short-lived narrowed tokens rather than through the local ma
 
 ### Live end-to-end checks
 
+These ran on the code before the implementation review below; the paths that review
+changed were rechecked live afterwards (see "Second verification pass").
+
 1. `login --reauth --project ...` completed one consent, verified Colab and Drive
    for the same account, and left global gcloud credentials unchanged. A v0.3
    configuration migrated automatically (`drive_folder: Colab-Persist`,
@@ -92,7 +95,34 @@ is checked against the selected account; restore validates manifest paths before
 applying modes; an empty workspace never supersedes a real checkpoint; long imports
 and saves refresh the VM's token; `login` and `setup` wait for newly enabled APIs.
 
-The offline suite (346 tests, fakes for the Colab and Drive APIs) passed on macOS
+### Second verification pass (before merge)
+
+- The new regression tests were run against the code from before the review fixes:
+  of 33, 30 failed there as they should, and 2 cover behaviour that already worked
+  (their fixes are caught by other tests). One, "restore never changes modes outside
+  the workspace", passed vacuously: its escape path never reached the target file.
+  It now aims at the file from restore's real staging directory and fails on the old
+  code (the file's mode became 0777).
+- Live, with the installed build on CPU runtimes: a detached run; `job` and `status`
+  while it ran; Ctrl+C (SIGINT to the whole process group) during `attach` exited 130
+  and the job kept running under the same run ID; a second `attach` finished, saved
+  and verified; `stop` reused the verified checkpoint and deleted the runtime; a new
+  runtime restored that exact checkpoint (same SHA-256) and resumed at step 41 of 45,
+  confirmed by downloading the checkpoint it saved; a plain `start` and `stop` created
+  no checkpoint; the account finished with zero runtimes.
+- Found live and fixed: `run.log` travels with checkpoints, and `run` followed it
+  from the first byte, replaying every earlier run's output in 64 KiB reads before the
+  new run's. Launch now records where the run's own output starts, and `run`,
+  `attach` and `job` show only the current run (rechecked live on a project with
+  earlier runs).
+- Not verified live: a Drive token expiring during a job longer than an hour while
+  no client is connected (offline tests only), account switching under 0.4, TPU and
+  high-memory shapes, `import-legacy` after the review fixes (it ran live once before
+  them), and the MCP tools called from a live Claude Code session (the CLI itself
+  goes through the same MCP server for `status`, `save`, `stop`, `snapshots` and
+  `restore`).
+
+The offline suite (349 tests, fakes for the Colab and Drive APIs) passed on macOS
 with Python 3.14. No account identifiers, project IDs or credentials are included
 in this record.
 

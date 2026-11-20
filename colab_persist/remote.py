@@ -594,8 +594,11 @@ class Store:
                                             "arguments": arguments, "interval": interval,
                                             "stop_after": bool(stop_after), "folder": self.folder,
                                             "snapshot_limit": self.snapshot_limit, "scratch": str(self.scratch)})
+        # run.log travels with checkpoints; this run's output starts where earlier runs ended.
+        previous_log = self.workspace(project) / "outputs" / "run.log"
+        log_start = previous_log.stat().st_size if previous_log.is_file() else 0
         self._write_job(project, fresh=True, run_id=run_id, state="starting", script=script, arguments=arguments,
-                        stop_after=bool(stop_after), exit_code=None, error=None)
+                        stop_after=bool(stop_after), exit_code=None, error=None, log_start=log_start)
         root = Path(__file__).resolve().parent.parent
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), env.get("PYTHONPATH")]))
@@ -658,7 +661,7 @@ class Store:
         if log.exists():
             size = log.stat().st_size
             if tail is not None:
-                offset = size - min(int(tail), LOG_CHUNK_BYTES)
+                offset = max(int(job.get("log_start", 0)), size - min(int(tail), LOG_CHUNK_BYTES))
             offset = max(0, min(int(offset), size))
             with log.open("rb") as stream:
                 stream.seek(offset)

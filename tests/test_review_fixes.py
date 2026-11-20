@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from colab_persist import accounts, backend, colab_api, drive_api, remote, runtimes
 
@@ -34,12 +34,16 @@ class RestoreSafetyTests(StoreBase):
         victim = self.base / "victim.txt"
         victim.write_text("keep my mode")
         os.chmod(victim, 0o600)
+        fresh = remote.Store(self.base / "vm-other", drive=self.drive)
+        # Restore extracts into <workspace parent>/restore-XXXX/workspace; aim the escape at the victim from there.
+        staging = fresh.workspace("demo").parent / "restore-x" / "workspace"
+        escape = os.path.relpath(victim, staging)
+        self.assertTrue(escape.startswith(".."))
         tampered = dict(saved)
-        tampered["files"] = {**saved["files"], "../../victim.txt": {"size": 1, "sha256": "0" * 64, "mode": 0o777}}
+        tampered["files"] = {**saved["files"], escape: {"size": 1, "sha256": "0" * 64, "mode": 0o777}}
         tampered = {k: v for k, v in tampered.items() if k not in ("reused", "durability", "manifest_file_id",
                                                                     "archive_file_id")}
         self.drive.corrupt(saved["manifest_file_id"], remote.manifest_bytes(tampered))
-        fresh = remote.Store(self.base / "vm-other", drive=self.drive)
         with self.assertRaises((ValueError, RuntimeError)):
             fresh.restore("demo")
         self.assertEqual(os.stat(victim).st_mode & 0o777, 0o600)
@@ -202,6 +206,53 @@ class LegacyNamesTests(StoreBase):
             report = store.import_legacy()
         self.assertEqual(sorted(report["ignored_folders"]), [".ipynb_checkpoints", "my project"])
         self.assertEqual(report["imported"], [])
+
+
+class PreviousRunLogTests(StoreBase):
+    """Found in live verification: run.log travels with checkpoints, so a new run must not replay it."""
+
+    def launch_with_output(self, new_output):
+        (self.workspace / "train.py").write_text("print('training')\n")
+
+        def popen(command, **kwargs):
+            spec = json.loads((self.store._job_dir("demo") / "job-spec.json").read_text())
+            with (self.workspace / "outputs" / "run.log").open("a") as log:
+                log.write(new_output)
+            remote.Store(self.store.scratch, drive=self.drive)._write_job("demo", run_id=spec["run_id"],
+                                                                          state="running")
+            return MagicMock()
+        with patch.object(remote.subprocess, "Popen", side_effect=popen):
+            return self.store.launch("demo", "train.py", [], interval=30)
+
+    def test_a_new_run_reports_only_its_own_log(self):
+        (self.workspace / "outputs").mkdir(exist_ok=True)
+        (self.workspace / "outputs" / "run.log").write_text("old run line\n" * 1000)
+        job = self.launch_with_output("new run line\n")
+        followed = self.store.job_status("demo", offset=job["log_start"])
+        self.assertEqual(followed["log"], "new run line\n")
+        self.assertEqual(self.store.job_status("demo", tail=4000)["log"], "new run line\n")
+
+    def test_a_first_run_starts_at_the_beginning(self):
+        job = self.launch_with_output("first line\n")
+        self.assertEqual(job["log_start"], 0)
+        self.assertEqual(self.store.job_status("demo", tail=4000)["log"], "first line\n")
+
+
+class RunFollowOffsetTests(BackendFixture, unittest.TestCase):
+    def setUp(self):
+        self.use_backend()
+        self.managed()
+        self.start_patch(patch.object(backend, "upload_source", return_value="train.py"))
+
+    def test_an_attached_run_follows_from_where_its_own_log_starts(self):
+        script = self.root / "train.py"
+        script.write_text("print('train')\n")
+        with patch.object(backend, "remote_call", side_effect=[{"restored": {"snapshot": "s0"}},
+                                                               {"state": "running", "run_id": "r1",
+                                                                "log_start": 13000}]), \
+             patch.object(backend, "monitor", return_value={"exit_code": 0}) as monitor:
+            backend.run_script(str(script), "demo")
+        self.assertEqual(monitor.call_args.kwargs["offset"], 13000)
 
 
 if __name__ == "__main__":
