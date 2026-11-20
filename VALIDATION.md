@@ -1,7 +1,130 @@
 # Verification record
 
-Tested on macOS with Python 3.14.7, Google Colab CLI 0.7.4, MCP Python SDK 2.2.0,
-and NVIDIA L4 Colab runtimes on 2026-09-27 (Asia/Dhaka).
+Version 0.4.0 was tested on macOS with Python 3.14, the official Colab REST API
+v1beta, Drive API v3, MCP Python SDK 2.2.0, and Colab CPU and NVIDIA L4 runtimes on
+2026-11-20 (Asia/Dhaka). Earlier sections record versions 0.1.0 through 0.3.0, which
+used Google Colab CLI 0.7.4.
+
+## Version 0.4.0 official Colab API and command-line Drive
+
+### Design review
+
+Two independent councils (Antigravity with Gemini 4 Neon at extra-high effort, and
+Codex with GPT-6.2-Sol at medium effort) reviewed the plan before implementation.
+Both converged on: the official REST API for runtime management with a per-account
+quota project, fresh runtime IDs recorded before each create, SSH through the
+runtime's `/colab/ssh` endpoint, archive-first then manifest commit order, detached
+jobs with `attach`, and no refresh token on the VM. Two of their recommendations
+were overruled by live evidence: Google blocks the full `drive` scope for gcloud's
+own OAuth client, so `drive.file` is the default; and archives go from the VM to
+Drive directly with short-lived narrowed tokens rather than through the local machine.
+
+### Live gate probes (no GPU)
+
+- The Colab API refused user ADC without a quota project (`SERVICE_DISABLED`). After
+  enabling `colaboratory.googleapis.com` and `drive.googleapis.com` on a free project
+  with no billing account, `subscription`, `runtimespecs` and `runtimes` answered.
+- gcloud's client obtained `drive.file`; a request for full `drive` showed Google's
+  "This app is blocked" page. A refresh can narrow the token to `drive.file` only
+  (tokeninfo confirmed the scope and a lifetime of about an hour).
+- `POST v1beta/runtimes` returned an unfinished Operation within a second; repeating
+  it with the same `runtimeId` and `requestId` returned the finished runtime.
+  Custom runtime IDs such as `cp-probe-xxxxxx` were accepted.
+- SSH through `wss://<runtime>/colab/ssh` worked with the official connection token
+  sent as a header, on a runtime created through the API.
+- From the VM, a resumable Drive upload with a pushed short-lived token succeeded;
+  Drive reported `sha256Checksum` and `md5Checksum`, both matching, and a ranged
+  download returned the right bytes.
+- Runtime hosts are `<port>-<endpoint>-<zone letter>`; the zone letter varies
+  (`-b`, `-c`), which the first endpoint parser got wrong and the import exposed.
+
+### Live end-to-end checks
+
+These ran on the code before the implementation review below; the paths that review
+changed were rechecked live afterwards (see "Second verification pass").
+
+1. `login --reauth --project ...` completed one consent, verified Colab and Drive
+   for the same account, and left global gcloud credentials unchanged. A v0.3
+   configuration migrated automatically (`drive_folder: Colab-Persist`,
+   `legacy_drive_folder: Colab-CUDA`).
+2. `setup`, `status`, `specs`, `sessions`, `mount`, `snapshots` and `tools` (12 tools)
+   worked without allocating a runtime.
+3. `start --cpu` created a runtime, installed the engine, connected Drive and prepared
+   a workspace in 22 seconds, with no browser step.
+4. `run examples/checkpoint_loop.py --detach` launched a detached job; `job` and
+   `status` worked while it ran; `attach` followed it to exit 0. The final checkpoint
+   was uploaded and verified, and the save reused it without a second upload.
+5. `stop` sealed, verified and deleted the runtime. A new runtime restored the
+   checkpoint (4 files) and the script resumed at step 31 of 35.
+6. `import-legacy` (for one real 0.3 project) mounted Drive the 0.3 way once (Colab's consent
+   page, approved in the browser; Colab's known first-mount race was retried) and
+   copied the newest 0.3 checkpoint unchanged: 2,518,380,984 archive bytes and
+   11,727 files, checked against its recorded SHA-256 before publishing. A second
+   run skipped it. `prepare` restored all 11,727 files on the VM with every hash
+   matching, and `stop` reused the imported checkpoint without uploading again.
+7. `run examples/cuda_demo.py --project v04-gpu` on an L4 compiled CUDA, verified 256
+   GPU results ("PASS ... NVIDIA L4"), saved with `drive_upload_verified`, and
+   stopped, 47 seconds end to end. A second run on a new L4 restored the project
+   and reported count 2 with previous count 1, then saved and stopped; the account
+   finished with zero runtimes.
+
+### Defects found live and fixed
+
+- Repeating the create call to wait for a runtime was rate-limited
+  (`RESOURCE_EXHAUSTED`) after the first call had already started a VM. The client
+  treated the refusal as "nothing created" and dropped its ledger entry, leaving an
+  empty L4 running unmanaged; it was deleted by its exact ID. Waiting now reads the
+  runtime and re-posts only occasionally, a refused repeat never abandons a VM, and
+  every abandoned creation keeps its ID so a late VM is adopted instead of orphaned.
+- The legacy mount helper waited on a dry-run check that keeps reporting
+  "unauthorized" after consent; it now polls the real propagation call.
+
+### Implementation review
+
+Both councils then reviewed the implemented code independently (Codex reproduced
+each finding with offline experiments). Fixed before release: checkpoint reuse now
+re-fetches both files by ID and requires Drive's SHA-256; hard-linked files are
+archived as regular files; created folder IDs are remembered and folders and
+manifests are created with Drive-generated IDs, so listing lag or a retried request
+cannot duplicate them; a replacement VM is told the last verified pair; the runtime
+ledger is locked and a listing miss is confirmed by ID before a record is dropped;
+a runtime is pending until it has connection details; detached jobs are pinned by
+run ID, a worker that dies at startup or becomes a zombie is reported as lost, and
+permanent Drive errors end a job instead of waiting a day; every minted Drive token
+is checked against the selected account; restore validates manifest paths before
+applying modes; an empty workspace never supersedes a real checkpoint; long imports
+and saves refresh the VM's token; `login` and `setup` wait for newly enabled APIs.
+
+### Second verification pass (before merge)
+
+- The new regression tests were run against the code from before the review fixes:
+  of 33, 30 failed there as they should, and 2 cover behaviour that already worked
+  (their fixes are caught by other tests). One, "restore never changes modes outside
+  the workspace", passed vacuously: its escape path never reached the target file.
+  It now aims at the file from restore's real staging directory and fails on the old
+  code (the file's mode became 0777).
+- Live, with the installed build on CPU runtimes: a detached run; `job` and `status`
+  while it ran; Ctrl+C (SIGINT to the whole process group) during `attach` exited 130
+  and the job kept running under the same run ID; a second `attach` finished, saved
+  and verified; `stop` reused the verified checkpoint and deleted the runtime; a new
+  runtime restored that exact checkpoint (same SHA-256) and resumed at step 41 of 45,
+  confirmed by downloading the checkpoint it saved; a plain `start` and `stop` created
+  no checkpoint; the account finished with zero runtimes.
+- Found live and fixed: `run.log` travels with checkpoints, and `run` followed it
+  from the first byte, replaying every earlier run's output in 64 KiB reads before the
+  new run's. Launch now records where the run's own output starts, and `run`,
+  `attach` and `job` show only the current run (rechecked live on a project with
+  earlier runs).
+- Not verified live: a Drive token expiring during a job longer than an hour while
+  no client is connected (offline tests only), account switching under 0.4, TPU and
+  high-memory shapes, `import-legacy` after the review fixes (it ran live once before
+  them), and the MCP tools called from a live Claude Code session (the CLI itself
+  goes through the same MCP server for `status`, `save`, `stop`, `snapshots` and
+  `restore`).
+
+The offline suite (349 tests, fakes for the Colab and Drive APIs) passed on macOS
+with Python 3.14. No account identifiers, project IDs or credentials are included
+in this record.
 
 ## Claude Code integration
 

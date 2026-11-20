@@ -1,3 +1,7 @@
+"""The end-user quota-project warning is silenced only while loading private credentials."""
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 import warnings
@@ -14,8 +18,11 @@ QUOTA_WARNING = (
 
 class CredentialWarningTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = {"expected_email": "test@example.com",
-                    "credentials_file": "/unused/private-adc.json"}
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "private-adc.json"
+        path.write_text(json.dumps({"type": "authorized_user"}))
+        self.cfg = {"expected_email": "test@example.com", "credentials_file": str(path)}
         self.credentials = object()
 
     def verify(self, load_warnings=(), response_warnings=()):
@@ -33,7 +40,6 @@ class CredentialWarningTests(unittest.TestCase):
 
         with patch.object(accounts.google.auth, "load_credentials_from_file", side_effect=load) as loader, \
              patch.object(accounts, "AuthorizedSession") as session, \
-             patch.object(accounts, "_get_adc_credentials", side_effect=AssertionError("Unexpected global ADC")), \
              warnings.catch_warnings(record=True) as observed:
             warnings.simplefilter("always")
             session.return_value.__enter__.return_value.get.side_effect = get
@@ -72,6 +78,12 @@ class CredentialWarningTests(unittest.TestCase):
             warnings.warn(QUOTA_WARNING, UserWarning)
             session.assert_not_called()
         self.assertEqual([str(item.message) for item in observed], [QUOTA_WARNING])
+
+    def test_missing_credentials_never_load_anything(self):
+        with patch.object(accounts.google.auth, "load_credentials_from_file") as loader:
+            with self.assertRaisesRegex(RuntimeError, "no private colab-persist login"):
+                accounts.verified_credentials({**self.cfg, "credentials_file": self.cfg["credentials_file"] + ".gone"})
+        loader.assert_not_called()
 
 
 if __name__ == "__main__":

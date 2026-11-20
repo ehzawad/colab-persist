@@ -17,8 +17,14 @@ async def perform(function, *args, **kwargs):
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
 async def runtime_status() -> dict:
-    """Check the configured Colab runtime and Drive mount without provisioning compute."""
+    """Check the configured Colab runtime and Drive connection without provisioning compute."""
     return await perform(backend.status)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+async def runtime_specs() -> dict:
+    """List the runtime types (GPU, TPU, CPU, high-memory) this account is eligible for, and its Colab tier."""
+    return await perform(backend.specs)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
@@ -33,38 +39,52 @@ async def plan_dataset(manifest_path: str, cache_gib: int = 40, reserve_gib: int
 
 
 @mcp.tool()
-async def start_runtime(gpu: str | None = None) -> dict:
+async def start_runtime(gpu: str | None = None, tpu: str | None = None, cpu: bool = False,
+                        high_mem: bool = False) -> dict:
     """Provision or reuse the configured runtime. Default GPU is L4. Consumes Colab units.
 
-    If drive_mounted is false, run colab-persist mount in a user terminal to authorize Drive.
+    Drive connects automatically through the Drive API; no browser consent is needed.
+    Use runtime_specs to see eligible GPU/TPU types. Choose at most one of gpu, tpu or cpu.
     """
-    return await perform(backend.start_runtime, gpu)
+    return await perform(backend.start_runtime, gpu, tpu, cpu, high_mem)
 
 
 @mcp.tool()
 async def prepare_workspace(project: str = "default") -> dict:
-    """Create a managed workspace or restore its latest Drive snapshot on a fresh VM."""
+    """Create a managed workspace or restore its latest Drive checkpoint on a fresh VM."""
     return await perform(backend.prepare, project)
 
 
 @mcp.tool()
 async def run_script(script_path: str, project: str = "default", arguments: list[str] | None = None,
                      source_directory: str | None = None, checkpoint_seconds: int = 60,
-                     stop_after: bool = True) -> dict:
-    """Run a local Python script on the active, Drive-mounted GPU VM.
+                     stop_after: bool = True, detach: bool = False) -> dict:
+    """Run a local Python script on the active GPU VM as a detached managed job.
 
     Restores previous files, uploads the script (or an explicitly selected source directory),
-    periodically checkpoints, flushes Drive on completion, then stops by default. Script may
-    invoke nvcc and other tools. Only workspace files are saved, not RAM or credentials.
-    Google may still terminate the VM; completed snapshots are recoverable. Can be long-running.
+    checkpoints to Drive periodically with verified uploads, saves on exit, then stops by default.
+    The job keeps running on the VM if this call is interrupted. With detach=true the call returns
+    right after launch; follow with job_status or attach_job. Only workspace files are saved.
     """
     return await perform(backend.run_script, script_path, project, arguments,
-                                   source_directory, checkpoint_seconds, stop_after)
+                         source_directory, checkpoint_seconds, stop_after, detach)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+async def job_status(project: str = "default") -> dict:
+    """Check a managed job's state, last checkpoint and recent log lines. Refreshes the VM's Drive token."""
+    return await perform(backend.job_status, project)
+
+
+@mcp.tool()
+async def attach_job(project: str = "default", stop_after: bool | None = None) -> dict:
+    """Follow a running managed job until it ends, then save and (by default) stop. Can be long-running."""
+    return await perform(backend.attach, project, stop_after)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
 async def list_checkpoints(project: str = "default") -> dict:
-    """List complete checkpoint manifests from the mounted Drive."""
+    """List complete checkpoints in Drive. Works from this computer without a running VM."""
     return {"checkpoints": await perform(backend.snapshots, project)}
 
 
@@ -76,21 +96,21 @@ async def restore_workspace(project: str = "default", snapshot: str = "latest") 
 
 @mcp.tool()
 async def save_workspaces() -> dict:
-    """Checkpoint all managed workspaces, flush Drive, and unmount it. VM stays allocated.
+    """Checkpoint all managed workspaces to Drive with verified uploads. VM stays allocated.
 
-    Refuses if managed jobs are active. Remount Drive before further persistence operations.
+    Refuses if managed jobs are active.
     """
     return await perform(backend.save_and_stop, stop=False)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructive_hint=True))
 async def safe_stop() -> dict:
-    """Save all managed workspaces and stop the VM only after Drive confirms its flush.
+    """Save all managed workspaces and stop the VM only after Drive verifies every upload.
 
     Unmanaged processes and files outside the workspace are not captured. Saving failures
     leave the VM running so the user can recover. Refuses while managed jobs are active.
-    With no managed workspace and Drive not mounted there is nothing to save; the VM stops
-    and the result reports nothing_to_save: true.
+    With no managed workspace there is nothing to save; the VM stops and the result
+    reports nothing_to_save: true.
     """
     return await perform(backend.save_and_stop, stop=True)
 
