@@ -1,4 +1,4 @@
-"""Regressions for defects found in the independent 0.4.0 implementation review."""
+"""Regression tests for defects fixed in 0.4."""
 import io
 import json
 import os
@@ -209,7 +209,7 @@ class LegacyNamesTests(StoreBase):
 
 
 class PreviousRunLogTests(StoreBase):
-    """Found in live verification: run.log travels with checkpoints, so a new run must not replay it."""
+    """run.log travels with checkpoints, so a new run must not replay it."""
 
     def launch_with_output(self, new_output):
         (self.workspace / "train.py").write_text("print('training')\n")

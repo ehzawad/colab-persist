@@ -149,7 +149,7 @@ class CheckpointTests(StoreCase):
 
 
 class LiveWriterTests(StoreCase):
-    """Found live: a script that rewrites its progress file every second failed most periodic saves."""
+    """A script that rewrites its files every second must not fail periodic saves."""
 
     def setUp(self):
         super().setUp()
