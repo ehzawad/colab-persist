@@ -5,6 +5,37 @@ v1beta, Drive API v3, MCP Python SDK 2.2.0, and Colab CPU and NVIDIA L4 runtimes
 2026-11-20 (Asia/Dhaka). Earlier sections record versions 0.1.0 through 0.3.0, which
 used Google Colab CLI 0.7.4.
 
+## Version 0.4.1 background Drive renewal and saves under live writers
+
+### Background Drive renewal
+
+A detached CPU job ran for 76 minutes (`checkpoint_loop.py --steps 4500`, a save
+every 5 minutes) and no colab-persist command contacted the VM from launch to exit;
+progress was read only from the helper's local log and the Drive listing. The helper
+started with `run`, kept running after the command exited, and renewed every 10
+minutes (minutes 10 to 71). At minute 60, when the token sent at launch had expired,
+the VM held the helper's token with 10 minutes left. Periodic checkpoints were saved
+and verified at minutes 61.5, 66.6 and 71.7 and the final one at 76.3; the helper
+then logged "No managed job is active; stopping." and exited by itself.
+
+### Saves under live writers (found during that run)
+
+Six of that run's periodic saves failed with "File changed during archive creation":
+the script replaced `progress.json` every second, and a save fingerprinted files,
+then waited on Drive, then archived them, so a rewrite in between failed it, and the
+one-second retry stayed in step with the writer. A busy `run.log` hits the same window.
+Saves now read the previous checkpoint first, hash each file from the exact bytes
+archived through one open descriptor (so atomically replaced files are archived
+whole), restart only when a file changes in place during its own read, and retry
+after a random pause; a file that never stops changing is still refused rather than
+archived torn. Offline tests reproduce the live error on 0.4.0 and pass on 0.4.1.
+
+Live on the fixed build, the same script with a save every 20 seconds for 200 steps:
+all 7 periodic saves and the final one succeeded with no errors, about 27 seconds
+apart, and the run saved, verified and stopped the VM.
+
+The offline suite (371 tests) passed on macOS with Python 3.14.
+
 ## Version 0.4.0 official Colab API and command-line Drive
 
 ### Design review

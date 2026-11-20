@@ -94,10 +94,12 @@ for substantive training/download work. A timed-out client does not prove the
 remote job stopped: check `job_status` before retrying; never start duplicate
 training blindly.
 
-The VM's Drive token lasts about an hour and is renewed by any call from this
-computer (`job_status` included). If the computer is away longer, periodic
-checkpoints pause; when the script exits, the job waits up to 24 hours in state
-`awaiting_drive` for a reconnect, then saves. `exited_unsaved` or `lost` means the
+The VM's Drive token lasts about an hour. While a job runs, a background helper
+on this computer renews it every 10 minutes (started by `run_script`; `job_status`
+restarts it), so checkpoints keep saving while the computer is awake and online.
+If the computer sleeps or goes offline, periodic checkpoints pause; when the script
+exits, the job waits up to 24 hours in state `awaiting_drive` for a reconnect, then
+saves. `exited_unsaved` or `lost` means the
 final save did not happen: the VM was left running, so fix the cause and run
 `safe_stop`. Report success only with the final save receipt
 (`drive_upload_verified: true`) and the script's exit code.
