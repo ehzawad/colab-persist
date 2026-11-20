@@ -119,7 +119,7 @@ colab-persist status
 The first run reports count 1; the second restores it and reports count 2 with
 previous count 1. Each successful run saves, verifies, and stops its VM, so the
 final status should be inactive. No browser step is needed for either VM. These
-runs consume Colab compute units. See [VALIDATION.md](VALIDATION.md).
+runs consume Colab compute units.
 
 Configuration lives in `~/.config/colab-persist/config.json`. Each account's
 private credentials, Cloud project and runtime ledger live under
@@ -461,8 +461,7 @@ recovery into a new workspace, corruption, interrupted and unverified uploads,
 list-after-write lag, credential and link exclusions, malicious archives, overwrite
 protection, script errors, detached jobs and token expiry, active-job locks,
 runtime-ledger safety, and refusal to stop after a failed save. Live GPU and Drive
-checks consume compute units and require your own account; see
-[VALIDATION.md](VALIDATION.md) for the maintainer's recorded verification.
+checks consume compute units and require your own account.
 
 Sources: [Colab REST API](https://developers.google.com/colab/api/reference/rest),
 [Colab MCP endpoint](https://developers.google.com/colab/api/reference/mcp),
